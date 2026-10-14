@@ -52,6 +52,27 @@ export interface AskUserOutputData {
 	awaitingSelection: true;
 }
 
+export interface ProposeFillDataItem {
+	field: string;
+	address: string;
+	value: string;
+	confidence?: number;
+	note?: string;
+}
+
+export interface ProposeFillDataInput {
+	assignmentId: string;
+	items: ProposeFillDataItem[];
+	recognizedFrom?: string;
+}
+
+export interface ProposeFillDataOutputData {
+	assignmentId: string;
+	items: ProposeFillDataItem[];
+	lowConfidenceCount: number;
+	recognizedFrom?: string;
+}
+
 export type AppDataParts = Record<string, unknown> & {
 	"retry-status": RetryStatusData;
 };
@@ -76,6 +97,10 @@ type SpecialAppTools = {
 		input: AskUserInput;
 		output: ToolResult<AskUserOutputData>;
 	};
+	propose_fill_data: {
+		input: ProposeFillDataInput;
+		output: ToolResult<ProposeFillDataOutputData>;
+	};
 };
 
 type GenericAppTools = {
@@ -92,6 +117,7 @@ export type TaskToolPart =
 	| Extract<ToolUIPart<AppTools>, { type: "tool-add_tasks" }>
 	| Extract<ToolUIPart<AppTools>, { type: "tool-complete_task" }>;
 export type AskUserToolPart = Extract<ToolUIPart<AppTools>, { type: "tool-ask_user" }>;
+export type ProposeFillDataToolPart = Extract<ToolUIPart<AppTools>, { type: "tool-propose_fill_data" }>;
 export type RetryStatusPart = {
 	type: "data-retry-status";
 	id?: string;
@@ -108,6 +134,17 @@ export function isTaskToolPart(part: AppUIMessagePart): part is TaskToolPart {
 
 export function isAskUserToolPart(part: AppUIMessagePart): part is AskUserToolPart {
 	return isAppToolPart(part) && part.type === "tool-ask_user";
+}
+
+export function isProposeFillDataToolPart(part: AppUIMessagePart): part is ProposeFillDataToolPart {
+	return isAppToolPart(part) && part.type === "tool-propose_fill_data";
+}
+
+export function getProposeFillDataOutputData(part: ProposeFillDataToolPart): ProposeFillDataOutputData | null {
+	if (part.state !== "output-available" || !part.output.success || !part.output.data) {
+		return null;
+	}
+	return part.output.data;
 }
 
 export function isRetryStatusPart(part: AppUIMessagePart): part is RetryStatusPart {

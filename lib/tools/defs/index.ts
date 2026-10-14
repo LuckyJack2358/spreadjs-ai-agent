@@ -120,3 +120,6 @@ export { default as manageCellType } from "./gateway/manage-cell-type";
 export { default as manageShape } from "./gateway/manage-shape";
 export { default as manageHyperlink } from "./gateway/manage-hyperlink";
 export { default as manageSlicer } from "./gateway/manage-slicer";
+
+// form — 单据模板化填报（模板制作 / 分派 / 识别填报）
+export * from "./form";

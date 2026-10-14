@@ -7,6 +7,10 @@ import { buildSystemPrompt } from "@/lib/agent/system-prompt";
 import { buildInjectionWarning } from "@/lib/agent/input-guard";
 import { recoverActiveModule } from "@/lib/agent/recover-module";
 import { ModuleTracker } from "@/lib/agent/module-tracker";
+import { filterBaseToolNames, filterGatewayToolNames } from "@/lib/tools/role-tools";
+import type { UserRole } from "@/lib/server/types";
+import { getCurrentUser } from "@/lib/server/identity";
+import { getRepo } from "@/lib/server/repo";
 import { UsageTracker } from "@/lib/agent/usage-tracker";
 import { buildLLM, detectProvider } from "@/lib/llm/provider";
 import { buildProviderOptions } from "@/lib/llm/provider-options";
@@ -48,6 +52,18 @@ async function resolveMcpTools() {
 		mcpContext: (await mcpManager.buildContext()) || undefined,
 		mcpToolNames: Object.keys(mcpToolDefs),
 	};
+}
+
+/**
+ * 从 cookie(sjs_uid) 解析当前用户角色。
+ * 数据库不可用（如测试环境）时返回 undefined，由调用方回落。
+ */
+function resolveRoleFromCookie(req: Request): UserRole | undefined {
+	try {
+		return getCurrentUser(req, getRepo()).role;
+	} catch {
+		return undefined;
+	}
 }
 
 function resolveModel(messages: AppUIMessage[]) {
@@ -110,9 +126,16 @@ export async function POST(req: Request) {
 	let workbookContext: string | undefined;
 	let taskContext: string | undefined;
 	let dirtyContext: string | undefined;
+	let templateContext: string | undefined;
+	let rawRole: UserRole | undefined;
+	let role: UserRole = "admin";
 
 	try {
-		({ messages, workbookContext, taskContext, dirtyContext } = await req.json());
+		({ messages, workbookContext, taskContext, dirtyContext, templateContext, role: rawRole } = await req.json());
+		// 角色仅影响工具可见面与系统提示词。
+		// 以 cookie（sjs_uid）解析出的身份为准，避免前端伪造越权；
+		// 无法解析身份时回落到请求体，再回落到管理员（保持既有行为）。
+		role = resolveRoleFromCookie(req) ?? (rawRole === "user" ? "user" : "admin");
 	} catch {
 		return new Response("Invalid request body", { status: 400 });
 	}
@@ -140,12 +163,13 @@ export async function POST(req: Request) {
 		.join(" ") ?? "";
 	const injectionWarning = buildInjectionWarning(lastUserText);
 
-	const baseTools = baseToolNames.filter(n => n in allTools);
-	const gatewayTools = gatewayToolNames.filter(n => n in allTools);
+	// 按角色过滤工具集：员工仅保留填报工具 + read_ranges，且不可用网关模块
+	const baseTools = filterBaseToolNames(role, baseToolNames.filter(n => n in allTools));
+	const gatewayTools = filterGatewayToolNames(role, gatewayToolNames.filter(n => n in allTools));
 
 	const isAnthropic = provider === "anthropic";
 	const providerOptions = buildProviderOptions(provider, activeModelName, activeBaseURL);
-	const systemPrompt = buildSystemPrompt({ workbookContext, taskContext, mcpContext, dirtyContext });
+	const systemPrompt = buildSystemPrompt({ workbookContext, taskContext, mcpContext, dirtyContext, role, templateContext });
 
 	const modelMessages = await convertToModelMessages(messages);
 

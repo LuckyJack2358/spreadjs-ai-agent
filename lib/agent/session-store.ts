@@ -82,6 +82,21 @@ export async function clearAllSessions(): Promise<void> {
 	await promisify(tx.objectStore(STORE_NAME).clear());
 }
 
+/** 批量删除指定前缀的所有会话（用于按用户清空） */
+export async function clearSessionsByPrefix(prefix: string): Promise<void> {
+	const db = await openDB();
+	const tx = db.transaction(STORE_NAME, "readwrite");
+	const store = tx.objectStore(STORE_NAME);
+	const keys: IDBValidKey[] = await new Promise((resolve, reject) => {
+		const req = store.getAllKeys();
+		req.onsuccess = () => resolve(req.result);
+		req.onerror = () => reject(req.error);
+	});
+	await Promise.all(
+		keys.filter((k) => typeof k === "string" && k.startsWith(prefix)).map((k) => promisify(store.delete(k))),
+	);
+}
+
 function toSummary(s: Session): SessionSummary {
 	return { id: s.id, title: s.title, createdAt: s.createdAt, updatedAt: s.updatedAt };
 }
@@ -92,12 +107,14 @@ function toSummary(s: Session): SessionSummary {
 export async function listSessionSummaries(
 	offset: number = 0,
 	limit: number = PAGE_SIZE,
+	prefix?: string,
 ): Promise<{ sessions: SessionSummary[]; total: number }> {
 	const db = await openDB();
 	const tx = db.transaction(STORE_NAME, "readonly");
 	const store = tx.objectStore(STORE_NAME);
 
 	const total: number = await promisify(store.count());
+	const match = (s: Session) => !prefix || s.id.startsWith(prefix);
 
 	const sessions: SessionSummary[] = await new Promise((resolve, reject) => {
 		const index = store.index("updatedAt");
@@ -110,13 +127,18 @@ export async function listSessionSummaries(
 				resolve(result);
 				return;
 			}
+			const value = cursor.value as Session;
+			if (!match(value)) {
+				cursor.continue();
+				return;
+			}
 			if (skipped < offset) {
 				skipped++;
 				cursor.continue();
 				return;
 			}
 			if (result.length < limit) {
-				result.push(toSummary(cursor.value as Session));
+				result.push(toSummary(value));
 				cursor.continue();
 			} else {
 				resolve(result);
@@ -125,7 +147,24 @@ export async function listSessionSummaries(
 		req.onerror = () => reject(req.error);
 	});
 
-	return { sessions, total };
+	const filteredTotal = prefix
+		? await new Promise<number>((resolve, reject) => {
+				let count = 0;
+				const req = store.index("updatedAt").openCursor(null, "prev");
+				req.onsuccess = () => {
+					const cursor = req.result;
+					if (!cursor) {
+						resolve(count);
+						return;
+					}
+					if (match(cursor.value as Session)) count++;
+					cursor.continue();
+				};
+				req.onerror = () => reject(req.error);
+		  })
+		: total;
+
+	return { sessions, total: filteredTotal };
 }
 
 /**
@@ -135,6 +174,7 @@ export async function searchSessionSummaries(
 	query: string,
 	offset: number = 0,
 	limit: number = PAGE_SIZE,
+	prefix?: string,
 ): Promise<{ sessions: SessionSummary[]; total: number }> {
 	const db = await openDB();
 	const tx = db.transaction(STORE_NAME, "readonly");
@@ -152,7 +192,7 @@ export async function searchSessionSummaries(
 				return;
 			}
 			const s = cursor.value as Session;
-			if (s.title.toLowerCase().includes(lower)) {
+			if ((!prefix || s.id.startsWith(prefix)) && s.title.toLowerCase().includes(lower)) {
 				result.push(toSummary(s));
 			}
 			cursor.continue();
@@ -246,6 +286,7 @@ export async function searchSessions(
 	};
 }
 
-export function generateSessionId(): string {
-	return `sess_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+/** 生成会话 id；可传前缀实现「按用户隔离」（如 u_user1_sess_...） */
+export function generateSessionId(prefix: string = "sess"): string {
+	return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 }

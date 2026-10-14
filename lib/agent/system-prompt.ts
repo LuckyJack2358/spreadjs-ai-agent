@@ -2,6 +2,8 @@
 // System Prompt 工程化 — 七区块模块化结构
 // ============================================================================
 
+import type { UserRole } from "@/lib/server/types";
+
 export interface SystemPromptContext {
 	/** 工作簿状态快照（由客户端每次请求时注入） */
 	workbookContext?: string;
@@ -11,6 +13,10 @@ export interface SystemPromptContext {
 	mcpContext?: string;
 	/** 用户手动修改记录（上次对话后的增量变更） */
 	dirtyContext?: string;
+	/** 当前用户角色（管理员 / 员工），影响业务能力边界 */
+	role?: UserRole;
+	/** 填报模板上下文（模板名 + 字段地图 + assignmentId，由客户端注入） */
+	templateContext?: string;
 }
 
 type SectionBuilder = (ctx: SystemPromptContext) => string;
@@ -201,17 +207,77 @@ ${ctx.mcpContext}
 };
 
 // ----------------------------------------------------------------------------
+// 9. 业务角色（管理员 / 员工）
+// ----------------------------------------------------------------------------
+const businessRole: SectionBuilder = (ctx) => {
+	if (ctx.role === "user") {
+		return `## 我的业务角色：单据填报员工
+
+你正在为一名被分派了填报任务的员工服务。你的职责是帮助他把线下纸质单据上的数据准确地录入到已载入的电子表格模板中。
+
+工作流程（严格遵循）：
+1. 用 list_my_assignments 查看「我的填报任务」，确认当前待填报任务
+2. 用 load_template 把模板载入画布（画布已有内容时先征得用户同意）
+3. 用户上传填写完毕的单据照片后，你从图片中识别每个字段对应的值
+4. 用 read_ranges 核对模板结构，确认字段对应的单元格地址
+5. 调用 propose_fill_data 提交识别结果（不要直接写单元格！），系统会弹出确认卡供用户核对
+6. 用户确认写入后，调用 submit_submission 提交本次填报（需附上单据图片文件名）
+
+硬性约束：
+- 只能通过 propose_fill_data / submit_submission 走填报流程；禁止用 write_data 等工具改写工作簿的其他区域
+- read_ranges 仅用于核对模板结构，不得越界读取无关区域
+- 字段地址一律来自「填报模板上下文」中的字段地图；不确定时先向用户确认
+- 识别不确定的字段必须标注低置信（confidence < 0.7）并说明，绝不允许臆造数据
+- 看不清的字段留空并提示用户手工修正，不要阻断整体提交`;
+	}
+	if (ctx.role === "admin") {
+		return `## 我的业务角色：管理员（模板制作与分派）
+
+你正在为系统管理员服务，负责把线下纸质单据变成可复用的填报模板，并把模板分派给具体员工。
+
+一、制作模板
+1. 用户上传空白单据照片后，用视觉能力识别单据结构，在工作簿中还原与纸质单据一致的表格布局
+2. 用 save_template 把当前工作簿保存为模板，并提供字段地图 fields（每个字段的 name 与目标单元格 address，跨 sheet 用 sheetName 区分）
+3. 模板同名保存会覆盖原模板并升级版本
+
+二、分派与查看
+1. list_templates / list_users 查看已有模板与用户
+2. 用 assign_template 按模板名 + 用户姓名分派；姓名模糊匹配失败或出现多个候选时，工具会返回候选列表，用 ask_user 让用户澄清，绝不臆测
+3. list_assignments 查看分派记录与状态（pending / submitted / revoked）
+
+约束：
+- 分派前先用 list_users 确认用户姓名
+- 用户表达含糊时用 ask_user 澄清，不要擅自选择模板或用户`;
+	}
+	return "";
+};
+
+// ----------------------------------------------------------------------------
+// 10. 填报模板上下文（动态注入）
+// ----------------------------------------------------------------------------
+const templateContextSection: SectionBuilder = (ctx) => {
+	if (!ctx.templateContext) return "";
+	return `## 填报模板上下文
+
+以下是由系统注入的当前填报任务与字段地图，字段地址即为「值 → 单元格」的映射依据，请严格据此填写：
+
+${ctx.templateContext}`;
+};
+
+// ----------------------------------------------------------------------------
 // 组装
 // ----------------------------------------------------------------------------
 
 const sections: SectionBuilder[] = [
 	role,
 	security,
+	businessRole,
 	capabilities,
 	workbookState,
 	userModifications,
 	taskState,
 	toolUsage,
+	templateContextSection,
 	behavior,
 	outputFormat,
 	mcpSection,

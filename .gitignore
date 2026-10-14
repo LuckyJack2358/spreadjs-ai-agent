@@ -48,3 +48,6 @@ yarn-error.log*
 next-env.d.ts
 
 .vscode
+
+# 本地运行数据（SQLite 库 + 上传图片）
+/data

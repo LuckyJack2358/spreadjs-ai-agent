@@ -28,12 +28,14 @@ import { useDirtyTracker } from "@/lib/hooks/useDirtyTracker";
 import { useToolDispatch } from "@/lib/hooks/useToolDispatch";
 import { useDestructiveGuard } from "@/lib/hooks/useDestructiveGuard";
 import { useSession, getActiveSessionId } from "@/lib/hooks/useSession";
+import { useUser } from "@/lib/hooks/useUser";
 import { useSheetInfo } from "@/lib/hooks/useSheetInfo";
 import { useServiceStatus } from "@/lib/hooks/useServiceStatus";
 import { useMcpServers } from "@/lib/hooks/useMcpServers";
 import { useContextUsage } from "@/lib/hooks/useContextUsage";
 import { SettingsPanel } from "@/components/settings-panel";
 import { useSettings } from "@/lib/hooks/useSettings";
+import { notifyFormDataChanged } from "@/lib/agent/form-context";
 import { useTheme } from "@/lib/hooks/useTheme";
 import { ServiceUnavailableBanner } from "@/components/ai-elements/service-unavailable-banner";
 import { PlusIcon, XIcon, FileIcon, ImageIcon, SparklesIcon, HistoryIcon, PaperclipIcon, Settings2Icon, WrenchIcon, RotateCcwIcon, GitBranchIcon, CopyIcon, PlayIcon, LoaderIcon, BrainIcon, PenLineIcon, AlertCircleIcon, CircleCheckIcon, ChevronDownIcon, PauseCircleIcon, MousePointerIcon } from "lucide-react";
@@ -58,6 +60,7 @@ import {
 	SPECIAL_TOOLS,
 	renderSpecialTool,
 	MixedGroup,
+	type SpecialToolExtras,
 } from "@/components/ai-elements/tool-call-display";
 import {
 	Conversation,
@@ -96,9 +99,11 @@ interface MessageItemProps {
 	onFork?: (messageId: string, withRestore: boolean) => void;
 	/** 下一条用户消息的文本，用于恢复 ask_user 的已选状态 */
 	nextUserText?: string;
+	/** 特殊工具（确认卡等）渲染所需的外部上下文 */
+	extras?: SpecialToolExtras;
 }
 
-const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecision, isLast, status, sendMessage, hasSnapshot, onFork, nextUserText }: MessageItemProps) {
+const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecision, isLast, status, sendMessage, hasSnapshot, onFork, nextUserText, extras }: MessageItemProps) {
 	const lastTaskIdx = findLastTaskToolIndex(message.parts);
 	const showInlineThinking = isLast && message.role === "assistant" && status === "submitted";
 	const isUser = message.role === "user";
@@ -158,7 +163,7 @@ const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecisi
 							const toolName = getToolName(part);
 							if (SPECIAL_TOOLS.has(toolName)) {
 								flushMixed();
-								const el = renderSpecialTool(part, i, sendMessage, lastTaskIdx, nextUserText, msgId, taskRenderDecision);
+								const el = renderSpecialTool(part, i, sendMessage, lastTaskIdx, nextUserText, msgId, taskRenderDecision, extras);
 								if (el) elements.push(el);
 							} else {
 								mixedBuf.push({ kind: "tool", part, index: i });
@@ -298,6 +303,8 @@ interface ChatPanelProps {
 
 export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: ChatPanelProps) {
 	const { workbook, isReady } = useSpreadJS();
+	// 当前身份（cookie sjs_uid）——会话/自动保存按用户隔离
+	const { userId, role } = useUser();
 	// 每次渲染更新 ref，保证 handleSubmit（useCallback 闭包）拿到最新 workbook
 	const workbookRef = useRef(workbook);
 	workbookRef.current = workbook;
@@ -306,6 +313,8 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const serviceAvailable = serviceStatus.available;
 	const visionAvailable = serviceStatus.visionAvailable;
 	const [input, setInput] = useState("");
+	/** 空态快捷提示填入后用于聚焦输入框 */
+	const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 	const [showHistory, setShowHistory] = useState(false);
 	const [showSettings, setShowSettings] = useState(false);
 	const [historyRefresh, setHistoryRefresh] = useState(0);
@@ -335,14 +344,14 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const [pendingAfterStop, setPendingAfterStop] = useState<string | null>(null);
 
 	// 会话管理
-	const { session, syncMessages, flushMessages, switchSession, newSession, onTitleChange, linkSnapshot, getSnapshotId, forkSession, saveTokenUsage } = useSession();
+	const { session, syncMessages, flushMessages, switchSession, newSession, onTitleChange, linkSnapshot, getSnapshotId, forkSession, saveTokenUsage } = useSession(userId);
 
 	// 提取的 hooks
-	const { pendingFiles, pendingFilesRef, fileInputRef, handleFileSelect, handleFileDrop, handlePaste, removePendingFile, consumePendingFile, consumePendingImageParts, clearAttachments } = useAttachments({ visionAvailable });
+	const { pendingFiles, pendingFilesRef, fileInputRef, handleFileSelect, handleFileDrop, handlePaste, removePendingFile, consumePendingFile, consumePendingImageParts, collectImages, clearAttachments } = useAttachments({ visionAvailable });
 	const [isDragging, setIsDragging] = useState(false);
 	// 工作簿变更追踪：记录每次 HTTP 请求之间的所有 SpreadJS 变更
 	const { consume: consumeDirty } = useDirtyTracker(workbook);
-	const { buildBody } = useChatContext(workbook, consumeDirty);
+	const { buildBody } = useChatContext(workbook, consumeDirty, role);
 	const { confirmDialog, requestConfirm, onConfirmChoice } = useDestructiveGuard(settings.allowAllDestructive);
 	const { onToolCall, addToolOutputRef } = useToolDispatch(workbook, pendingFilesRef, requestConfirm, refreshSheetInfo);
 
@@ -368,6 +377,11 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				(p) => isAppToolPart(p) && getToolName(p) === "ask_user" && p.state === "output-available",
 			);
 			if (hasAskUser) return false;
+			// propose_fill_data 输出后暂停循环：等用户在确认卡上「确认写入 / 提交」
+			const hasFillProposal = last.parts.some(
+				(p) => isAppToolPart(p) && getToolName(p) === "propose_fill_data" && p.state === "output-available",
+			);
+			if (hasFillProposal) return false;
 		}
 
 		// 步数上限保护：仅在本轮所有工具都完成（即将触发下一次 auto-send）时才计步。
@@ -610,10 +624,10 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				autoSaveTimerRef.current = null;
 				// 工作簿 + 会话消息一起保存
 				flushMessages();
-				saveWorkbook(workbook).then(() => setAutoSaveExists(true)).catch(() => {});
+				saveWorkbook(workbook, userId).then(() => setAutoSaveExists(true)).catch(() => {});
 			}, 500);
 		}
-	}, [isGenerating, settings.autoSave, workbook, stepLimitPaused, flushMessages]);
+	}, [isGenerating, settings.autoSave, workbook, stepLimitPaused, flushMessages, userId]);
 
 	// 中断后等 status 回 ready 再发送（避免 stop()+setTimeout(0) 竞态）
 	useEffect(() => {
@@ -633,21 +647,21 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	useEffect(() => {
 		if (!settings.autoSave || !workbook || autoRestoreDoneRef.current) return;
 		autoRestoreDoneRef.current = true;
-		loadWorkbook().then((data) => {
+		loadWorkbook(userId).then((data) => {
 			if (!data) return;
 			setAutoSaveExists(true);
 			workbook.suspendPaint();
 			workbook.fromJSON(data);
 			workbook.resumePaint();
 		}).catch(() => {});
-	}, [settings.autoSave, workbook]);
+	}, [settings.autoSave, workbook, userId]);
 
 	// 自动恢复会话：页面加载后从 IndexedDB 恢复上次活跃会话
 	const sessionRestoreDoneRef = useRef(false);
 	useEffect(() => {
 		if (!settings.autoRestoreSession || sessionRestoreDoneRef.current) return;
 		sessionRestoreDoneRef.current = true;
-		const activeId = getActiveSessionId();
+		const activeId = getActiveSessionId(userId);
 		if (!activeId) return;
 		switchSession(activeId).then((msgs) => {
 			if (msgs.length > 0) {
@@ -655,12 +669,12 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				prevUserMsgCountRef.current = msgs.filter((m) => m.role === "user").length;
 			}
 		}).catch(() => {});
-	}, [settings.autoRestoreSession, switchSession, setMessages]);
+	}, [settings.autoRestoreSession, switchSession, setMessages, userId]);
 
 	// 页面加载时检测是否存在已保存数据
 	useEffect(() => {
 		if (settings.autoSave) {
-			hasAutoSaveData().then(setAutoSaveExists).catch(() => {});
+			hasAutoSaveData(userId).then(setAutoSaveExists).catch(() => {});
 		}
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, []);
@@ -677,7 +691,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				pendingSnapshotRef.current = snapshotId;
 				// 自动保存开启时，同步将同一份快照写入 autosave-store
 				if (settings.autoSave) {
-					saveWorkbook(workbook).then(() => setAutoSaveExists(true)).catch(() => {});
+					saveWorkbook(workbook, userId).then(() => setAutoSaveExists(true)).catch(() => {});
 				}
 			} catch {
 				// 快照保存失败，继续执行
@@ -733,7 +747,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 			snapshotStoreIdb.save(snapshotId, wb).then(() => {
 				// 自动保存开启时，同步将同一份快照写入 autosave-store
 				if (settings.autoSave) {
-					saveWorkbook(wb).then(() => setAutoSaveExists(true)).catch(() => {});
+					saveWorkbook(wb, userId).then(() => setAutoSaveExists(true)).catch(() => {});
 				}
 			}).catch(() => {
 				pendingSnapshotRef.current = null;
@@ -816,8 +830,20 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		}
 	}, [session.id, handleStop, switchSession, setMessages, clearError, clearAttachments]);
 
-	const handleEmptySend = useCallback((text: string) => {
-		sendMessageWithSnapshotRef.current({ text });
+	/**
+	 * 空态快捷提示：只把提示词填入输入框，由用户编辑确认后手动发送。
+	 * 例如「把模板分派给某人」可先改成具体员工姓名再发送。
+	 */
+	const handleStarterInsert = useCallback((text: string) => {
+		setInput(text);
+		// 等 React 提交后再聚焦，并把光标移到末尾，方便继续补全
+		requestAnimationFrame(() => {
+			const el = textareaRef.current;
+			if (!el) return;
+			el.focus();
+			const end = el.value.length;
+			el.setSelectionRange(end, end);
+		});
 	}, []);
 
 	const handleFork = useCallback(async (messageId: string, withRestore: boolean) => {
@@ -854,14 +880,14 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const handleUpdateSettings = useCallback((patch: Partial<typeof settings>) => {
 		updateSettings(patch);
 		if (patch.autoSave === false) {
-			clearWorkbook().then(() => setAutoSaveExists(false)).catch(() => {});
+			clearWorkbook(userId).then(() => setAutoSaveExists(false)).catch(() => {});
 		}
-	}, [updateSettings]);
+	}, [updateSettings, userId]);
 
 	const handleClearAutoSave = useCallback(async () => {
-		await clearWorkbook();
+		await clearWorkbook(userId);
 		setAutoSaveExists(false);
-	}, []);
+	}, [userId]);
 
 
 	// 导出指定会话
@@ -929,6 +955,24 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		if (!workbook || !currentReplySnapshotId) return;
 		snapshotStoreIdb.restore(currentReplySnapshotId, workbook).catch(() => {});
 	}, [handleStop, workbook, currentReplySnapshotId]);
+
+	// 确认卡（单据填报）所需的外部上下文：
+	// - collectImages：发送后图片仍留在暂存区，可按文件名取回单据图
+	// - onFilled：写入完成后立即自动保存，避免刷新丢失
+	// - onSubmitted：提交成功后刷新员工任务列表 / 管理员提交记录
+	const toolExtras = useMemo<SpecialToolExtras>(() => ({
+		collectImages,
+		onFilled: () => {
+			const wb = workbookRef.current;
+			if (!wb) return;
+			flushMessages();
+			saveWorkbook(wb, userId).then(() => setAutoSaveExists(true)).catch(() => {});
+		},
+		onSubmitted: () => {
+			flushMessages();
+			notifyFormDataChanged();
+		},
+	}), [collectImages, flushMessages, userId]);
 
 	return (
 		<div className="flex h-full flex-col bg-background relative">
@@ -1016,7 +1060,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 			<Conversation className="chat-scrollbar flex-1">
 				<ConversationContent className="gap-5 px-4 py-4">
 					{messages.length === 0 ? (
-						<EmptyState onSend={handleEmptySend} isReady={isReady} />
+						<EmptyState onInsertPrompt={handleStarterInsert} isReady={isReady} role={role} />
 					) : (
 						messages.map((message, msgIdx) => {
 							let nextUserText: string | undefined;
@@ -1039,6 +1083,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 									hasSnapshot={!!getSnapshotId(message.id)}
 									onFork={handleFork}
 									nextUserText={nextUserText}
+									extras={toolExtras}
 								/>
 							);
 						})
@@ -1222,6 +1267,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 						</div>
 					)}
 					<PromptInputTextarea
+						ref={textareaRef}
 						value={input}
 						onChange={(e) => setInput(e.target.value)}
 						onPaste={handlePaste}

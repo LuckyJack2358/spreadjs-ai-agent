@@ -2,6 +2,13 @@
 
 import { useRef, useState, useCallback } from "react";
 import type { FileUIPart } from "ai";
+import { compressImageFile } from "@/lib/image/compress";
+
+/** 单据图附件（确认卡提交时按名字取用） */
+export interface PendingImageRef {
+	name: string;
+	dataUrl: string;
+}
 
 export interface PendingFile {
 	name: string;
@@ -80,6 +87,8 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 	const visionAvailable = options?.visionAvailable ?? true;
 	const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
 	const pendingFilesRef = useRef(new Map<string, string>());
+	/** 仅图片：name → data URL（发送后仍保留，供 save_template / submit_submission 按名取用） */
+	const imageDataUrlsRef = useRef(new Map<string, string>());
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const pasteCounterRef = useRef(0);
 
@@ -90,12 +99,23 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 				console.warn("[useAttachments] Vision 模型不可用，已忽略图片:", file.name);
 				return;
 			}
-			const dataUrl = await fileToDataUrl(file);
+			// 上传前压缩：长边 ≤ 2000px、JPEG q0.8、≤ 5MB（压缩失败则回落到原图）
+			let dataUrl: string;
+			let size = file.size;
+			try {
+				const prepared = await compressImageFile(file);
+				dataUrl = prepared.dataUrl;
+				size = prepared.size;
+			} catch (e) {
+				console.warn("[useAttachments] 图片压缩失败，使用原图:", e);
+				dataUrl = await fileToDataUrl(file);
+			}
 			// 同步存入 ref，供 add_picture 工具自动注入（镜像 import_file 模式）
 			pendingFilesRef.current.set(file.name, dataUrl);
+			imageDataUrlsRef.current.set(file.name, dataUrl);
 			setPendingFiles(prev => [...prev, {
 				name: file.name,
-				size: file.size,
+				size,
 				fileType: "image",
 				dataUrl,
 				mediaType: getImageMediaType(file),
@@ -152,9 +172,18 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 			if (file) {
 				// 无论是电子表格还是图片，都从 ref 中移除
 				pendingFilesRef.current.delete(file.name);
+				imageDataUrlsRef.current.delete(file.name);
 			}
 			return prev.filter((_, i) => i !== index);
 		});
+	}, []);
+
+	/**
+	 * 收集当前仍可用的单据图（name + data URL）。
+	 * 发送后不清空，因此确认卡/工具可在后续轮次按文件名取用。
+	 */
+	const collectImages = useCallback((): PendingImageRef[] => {
+		return Array.from(imageDataUrlsRef.current, ([name, dataUrl]) => ({ name, dataUrl }));
 	}, []);
 
 	/**
@@ -192,12 +221,14 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 	const clearAttachments = useCallback(() => {
 		setPendingFiles([]);
 		pendingFilesRef.current.clear();
+		imageDataUrlsRef.current.clear();
 		pasteCounterRef.current = 0;
 	}, []);
 
 	return {
 		pendingFiles,
 		pendingFilesRef,
+		imageDataUrlsRef,
 		fileInputRef,
 		handleFileSelect,
 		handleFileDrop,
@@ -205,6 +236,7 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 		removePendingFile,
 		consumePendingFile,
 		consumePendingImageParts,
+		collectImages,
 		clearAttachments,
 	};
 }

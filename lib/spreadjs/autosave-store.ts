@@ -8,7 +8,12 @@ import type { SpreadWorkbook } from "@/lib/agent/types";
 const DB_NAME = "spreadjs-agent-autosave";
 const DB_VERSION = 1;
 const STORE_NAME = "autosave";
-const RECORD_KEY = "current";
+const RECORD_KEY_PREFIX = "current:";
+
+/** 每个用户一份自动保存记录，避免身份切换后看到他人的画布 */
+function recordKey(userId: string): string {
+	return `${RECORD_KEY_PREFIX}${userId}`;
+}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -35,20 +40,20 @@ function promisify<T>(req: IDBRequest<T>): Promise<T> {
 	});
 }
 
-/** 保存工作簿 JSON 到 IndexedDB（覆盖写） */
-export async function saveWorkbook(workbook: SpreadWorkbook): Promise<void> {
+/** 保存工作簿 JSON 到 IndexedDB（按用户覆盖写） */
+export async function saveWorkbook(workbook: SpreadWorkbook, userId: string): Promise<void> {
 	const data = workbook.toJSON();
 	const db = await openDB();
 	const tx = db.transaction(STORE_NAME, "readwrite");
-	await promisify(tx.objectStore(STORE_NAME).put(data, RECORD_KEY));
+	await promisify(tx.objectStore(STORE_NAME).put(data, recordKey(userId)));
 }
 
 /** 从 IndexedDB 读取工作簿 JSON，不存在时返回 null */
-export async function loadWorkbook(): Promise<object | null> {
+export async function loadWorkbook(userId: string): Promise<object | null> {
 	try {
 		const db = await openDB();
 		const tx = db.transaction(STORE_NAME, "readonly");
-		const result = await promisify(tx.objectStore(STORE_NAME).get(RECORD_KEY));
+		const result = await promisify(tx.objectStore(STORE_NAME).get(recordKey(userId)));
 		return result ?? null;
 	} catch {
 		return null;
@@ -56,11 +61,11 @@ export async function loadWorkbook(): Promise<object | null> {
 }
 
 /** 检查是否存在已保存的工作簿数据 */
-export async function hasAutoSaveData(): Promise<boolean> {
+export async function hasAutoSaveData(userId: string): Promise<boolean> {
 	try {
 		const db = await openDB();
 		const tx = db.transaction(STORE_NAME, "readonly");
-		const count = await promisify(tx.objectStore(STORE_NAME).count(RECORD_KEY));
+		const count = await promisify(tx.objectStore(STORE_NAME).count(recordKey(userId)));
 		return count > 0;
 	} catch {
 		return false;
@@ -68,11 +73,11 @@ export async function hasAutoSaveData(): Promise<boolean> {
 }
 
 /** 清除保存的工作簿 JSON */
-export async function clearWorkbook(): Promise<void> {
+export async function clearWorkbook(userId: string): Promise<void> {
 	try {
 		const db = await openDB();
 		const tx = db.transaction(STORE_NAME, "readwrite");
-		await promisify(tx.objectStore(STORE_NAME).delete(RECORD_KEY));
+		await promisify(tx.objectStore(STORE_NAME).delete(recordKey(userId)));
 	} catch {
 		// ignore
 	}

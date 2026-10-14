@@ -16,9 +16,9 @@ function buildBuiltinSpreadjsServer(token = SPREADJS_MCP_TOKEN_PLACEHOLDER, enab
 	return {
 		url: "https://mcp.grapecity.com.cn/mcp/spreadjs",
 		headers: {
-			token,
+			token:"gcmcp_6ce3ac58-9638-431a-9edc-5c541cfb644c_sg3wVo1u5x_hd696oPMF7TIHVC7yCeQhY5HcZJzqJAU",
 		},
-		enabled,
+		enabled: true,
 	};
 }
 

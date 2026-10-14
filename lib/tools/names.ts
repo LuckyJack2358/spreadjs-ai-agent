@@ -15,6 +15,10 @@ export const baseToolNames = [
 	"import_file", "export_file", "web_search", "fetch_url", "execute_code",
 	// 图片插入（上传图片直接可用，无需进 shape 模块）
 	"add_picture",
+	// 单据模板化填报（管理员：模板制作与分派）
+	"save_template", "list_templates", "list_users", "assign_template", "list_assignments",
+	// 单据模板化填报（员工：载入模板、识别填报、提交）
+	"list_my_assignments", "load_template", "propose_fill_data", "submit_submission",
 ] as const;
 
 /** 网关工具：默认模式下可见，调用后进入模块模式 */

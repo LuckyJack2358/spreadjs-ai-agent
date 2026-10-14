@@ -10,9 +10,29 @@ import { createToolCache, type ToolCache } from "@/lib/hooks/useToolCache";
 import { resolveAddress, parseRangeAddress } from "@/lib/spreadjs/utils";
 import { loadBridge } from "@/lib/tools/types";
 import type { ConfirmRequest } from "@/lib/hooks/useDestructiveGuard";
+import { setFormContext } from "@/lib/agent/form-context";
+import type { LoadTemplateOutput } from "@/lib/tools/defs/form/load-template";
+import type { TemplateField } from "@/lib/server/types";
 
-/** Agent 自管理工具名称集合（handler 不依赖 workbook） */
-const AGENT_TOOLS = new Set(["add_tasks", "complete_task", "ask_user"]);
+/**
+ * Agent 自管理工具名称集合（handler 不依赖 workbook）。
+ * 单据填报类工具中，管理工具与识别整理工具都不需要 workbook；
+ * load_template / submit_submission 会读写工作簿，必须等画布就绪。
+ */
+const AGENT_TOOLS = new Set([
+	"add_tasks",
+	"complete_task",
+	"ask_user",
+	// 管理员：模板制作与分派
+	"save_template",
+	"list_templates",
+	"list_users",
+	"assign_template",
+	"list_assignments",
+	// 员工：任务列表 + 识别结果整理（写入由确认卡负责）
+	"list_my_assignments",
+	"propose_fill_data",
+]);
 
 /** 工具执行超时（ms），防止 handler hang 导致 agent 循环永久卡死 */
 const TOOL_TIMEOUT_MS = 60_000;
@@ -28,6 +48,19 @@ function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Prom
 			(e) => { clearTimeout(timer); reject(e); },
 		);
 	});
+}
+
+/** 按文件名从暂存区取出图片 data URL（缺失的静默跳过，由工具/服务端报错兜底） */
+function pickImages(
+	store: Map<string, string> | null | undefined,
+	names: string[],
+): Array<{ name: string; dataUrl: string }> {
+	const out: Array<{ name: string; dataUrl: string }> = [];
+	for (const name of names) {
+		const dataUrl = store?.get(name);
+		if (dataUrl) out.push({ name, dataUrl });
+	}
+	return out;
 }
 
 /** addToolOutput 函数签名（AI SDK 6 discriminated union） */
@@ -389,6 +422,14 @@ export function useToolDispatch(
 				}
 			}
 
+			// save_template / submit_submission: 按文件名把图片附件转成 { name, dataUrl } 注入
+			if (name === "save_template" && !input.sourceImages && Array.isArray(input.sourceImageNames)) {
+				input.sourceImages = pickImages(pendingFilesRef.current, input.sourceImageNames as string[]);
+			}
+			if (name === "submit_submission" && !input.images && Array.isArray(input.imageNames)) {
+				input.images = pickImages(pendingFilesRef.current, input.imageNames as string[]);
+			}
+
 			// 只读工具缓存命中 → 直接返回
 			const cachedResult = cache.get(name, input);
 			if (cachedResult) {
@@ -433,6 +474,20 @@ export function useToolDispatch(
 			} else {
 				cache.set(name, input, result);
 				emitOutput({ tool: name, toolCallId, output: result }, name);
+			}
+
+			// load_template 成功后记录当前填报上下文（随 chat body 注入模板字段地图）
+			if (name === "load_template") {
+				const lt = result.data as LoadTemplateOutput | undefined;
+				if (lt && !lt.needsConfirmation && lt.assignmentId) {
+					setFormContext({
+						assignmentId: lt.assignmentId,
+						templateId: lt.templateId ?? null,
+						templateName: lt.templateName,
+						fields: (lt.fields ?? []) as TemplateField[],
+						sourceImages: lt.sourceImages ?? [],
+					});
+				}
 			}
 
 			// 非只读、非 Agent 工具（即写入类工具）执行后清空缓存

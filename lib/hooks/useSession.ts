@@ -14,24 +14,27 @@ import { taskStore } from "@/lib/agent/task-store";
 // useSession — 管理当前会话状态，自动持久化到 IndexedDB
 // ============================================================================
 
-const ACTIVE_SESSION_KEY = "spreadjs-agent-active-session";
+/** 每个用户独立记录当前活动会话，避免身份切换后串会话 */
+function activeSessionKey(userId: string): string {
+	return `spreadjs-agent-active-session:${userId}`;
+}
 
-export function getActiveSessionId(): string | null {
+export function getActiveSessionId(userId: string): string | null {
 	if (typeof window === "undefined") return null;
-	return localStorage.getItem(ACTIVE_SESSION_KEY);
+	return localStorage.getItem(activeSessionKey(userId));
 }
 
-function setActiveSessionId(id: string) {
-	localStorage.setItem(ACTIVE_SESSION_KEY, id);
+function setActiveSessionId(userId: string, id: string) {
+	localStorage.setItem(activeSessionKey(userId), id);
 }
 
-function clearActiveSessionId() {
-	localStorage.removeItem(ACTIVE_SESSION_KEY);
+function clearActiveSessionId(userId: string) {
+	localStorage.removeItem(activeSessionKey(userId));
 }
 
-function createNewSession(): Session {
+function createNewSession(userId: string): Session {
 	return {
-		id: generateSessionId(),
+		id: generateSessionId(`u_${userId}`),
 		title: "新会话",
 		messages: [],
 		snapshotMap: {},
@@ -77,8 +80,8 @@ interface UseSessionReturn {
 	saveTokenUsage: (usage: { promptTokens: number; contextWindow: number }) => void;
 }
 
-export function useSession(): UseSessionReturn {
-	const [session, setSession] = useState<Session>(createNewSession);
+export function useSession(userId: string): UseSessionReturn {
+	const [session, setSession] = useState<Session>(() => createNewSession(userId));
 	const titleCallbacksRef = useRef<Set<(title: string) => void>>(new Set());
 	const titleGeneratedRef = useRef(false);
 
@@ -115,7 +118,7 @@ export function useSession(): UseSessionReturn {
 						updatedAt: shouldSkipTimestamp ? prev.updatedAt : Date.now(),
 					};
 					saveSession(updated).catch(() => {});
-					setActiveSessionId(prev.id);
+					setActiveSessionId(userId, prev.id);
 					return updated;
 				});
 			}, 2000);
@@ -155,7 +158,7 @@ export function useSession(): UseSessionReturn {
 				}
 			}
 		},
-		[],
+		[userId],
 	);
 
 	const flushMessages = useCallback(() => {
@@ -175,10 +178,10 @@ export function useSession(): UseSessionReturn {
 				updatedAt: Date.now(),
 			};
 			saveSession(updated).catch(() => {});
-			setActiveSessionId(prev.id);
+			setActiveSessionId(userId, prev.id);
 			return updated;
 		});
-	}, []);
+	}, [userId]);
 
 	const switchSession = useCallback(async (sessionId: string): Promise<AppUIMessage[]> => {
 		// 取消挂起的防抖定时器，防止旧会话的消息写入新会话
@@ -203,7 +206,7 @@ export function useSession(): UseSessionReturn {
 		skipTimestampRef.current = true;
 		latestMessagesRef.current = found.messages;
 		setSession(found);
-		setActiveSessionId(found.id);
+		setActiveSessionId(userId, found.id);
 
 		// 恢复目标会话的任务计划
 		if (found.taskPlans && found.taskPlans.length > 0) {
@@ -213,7 +216,7 @@ export function useSession(): UseSessionReturn {
 		}
 
 		return found.messages;
-	}, []);
+	}, [userId]);
 
 	const newSession = useCallback((): Session => {
 		// 取消挂起的防抖定时器，防止旧会话的消息写入新会话
@@ -233,13 +236,13 @@ export function useSession(): UseSessionReturn {
 		}
 
 		taskStore.reset();
-		const s = createNewSession();
+		const s = createNewSession(userId);
 		titleGeneratedRef.current = false;
 		latestMessagesRef.current = [];
 		setSession(s);
-		clearActiveSessionId();
+		clearActiveSessionId(userId);
 		return s;
-	}, []);
+	}, [userId]);
 
 	const onTitleChange = useCallback((cb: (title: string) => void) => {
 		titleCallbacksRef.current.add(cb);
@@ -297,7 +300,7 @@ export function useSession(): UseSessionReturn {
 		}
 
 		const forked: Session = {
-			id: generateSessionId(),
+			id: generateSessionId(`u_${userId}`),
 			title: `${sessionRef.current.title}（分支）`,
 			messages: forkedMessages,
 			snapshotMap: forkedSnapshotMap,
@@ -310,7 +313,7 @@ export function useSession(): UseSessionReturn {
 		taskStore.reset();
 		setSession(forked);
 		return { session: forked, inputText };
-	}, []);
+	}, [userId]);
 
 	// 注意：不再在初次挂载时持久化空会话。
 	// 会话仅在收到第一条消息（syncMessages 调用）时才写入 DB，

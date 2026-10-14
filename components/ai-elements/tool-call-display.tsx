@@ -7,13 +7,16 @@ import type { Task } from "@/lib/agent/task-types";
 import {
 	getAppToolName,
 	getAskUserOutputData,
+	getProposeFillDataOutputData,
 	getTaskToolData,
 	isAskUserToolPart,
+	isProposeFillDataToolPart,
 	isTaskToolPart,
 	type AppToolUIPart,
 	type AppUIMessagePart,
 } from "@/lib/agent/ui-message";
 import { AskUserOptions } from "@/components/ai-elements/ask-user-options";
+import { FillConfirmCard, type FillImageAttachment } from "@/components/ai-elements/fill-confirm-card";
 import {
 	Collapsible,
 	CollapsibleContent,
@@ -44,7 +47,17 @@ export function findLastTaskToolIndex(parts: AppUIMessagePart[]): number {
 }
 
 /** 特殊工具名集合（不参与分组折叠） */
-export const SPECIAL_TOOLS = new Set(["add_tasks", "complete_task", "ask_user"]);
+export const SPECIAL_TOOLS = new Set(["add_tasks", "complete_task", "ask_user", "propose_fill_data"]);
+
+/** 特殊工具渲染所需的外部队境（确认卡等） */
+export interface SpecialToolExtras {
+	/** 收集当前会话仍可用的单据图 */
+	collectImages?: () => FillImageAttachment[];
+	/** 确认写入完成回调（触发自动保存） */
+	onFilled?: () => void;
+	/** 提交成功回调（刷新任务列表） */
+	onSubmitted?: (info: { submissionId: string; createdAt: number }) => void;
+}
 
 /** 从工具输出中提取任务快照（含 planId 用于过滤旧计划） */
 function extractTaskSnapshot(part: AppToolUIPart): { planId?: string; tasks: Task[] } | null {
@@ -63,8 +76,24 @@ export function renderSpecialTool(
 	nextUserText?: string,
 	messageId?: string,
 	taskRenderDecision?: Map<string, "live" | "snapshot">,
+	extras?: SpecialToolExtras,
 ): ReactNode | null {
 	const toolName = getToolName(part);
+
+	if (toolName === "propose_fill_data" && isProposeFillDataToolPart(part)) {
+		const data = getProposeFillDataOutputData(part);
+		if (data) {
+			return (
+				<FillConfirmCard
+					key={`tool-${index}`}
+					data={data}
+					collectImages={extras?.collectImages}
+					onWritten={extras?.onFilled}
+					onSubmitted={extras?.onSubmitted}
+				/>
+			);
+		}
+	}
 
 	if (isTaskToolPart(part)) {
 		// 优先使用跨消息的决策表
