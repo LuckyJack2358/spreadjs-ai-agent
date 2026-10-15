@@ -23,6 +23,8 @@ import { ZoomableImage } from "@/components/ui/zoomable-image";
 export interface FillImageAttachment {
 	name: string;
 	dataUrl: string;
+	/** 附件阶段已落盘的 imageId：提交时直接复用，不再重传这张大图 */
+	imageId?: string;
 }
 
 interface FillConfirmCardProps {

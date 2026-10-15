@@ -1,10 +1,13 @@
 import { getUsage } from "@/lib/llm/usage-store";
-import { MODEL_CONTEXT_WINDOW } from "@/lib/config";
+import { getContextWindowInfo, LLM_CONFIG } from "@/lib/config";
 
-export async function GET() {
-	const usage = getUsage();
+export async function GET(req: Request) {
+	const requestId = new URL(req.url).searchParams.get("requestId") ?? undefined;
+	const usage = getUsage(requestId);
+	const info = getContextWindowInfo(usage?.model ?? LLM_CONFIG.model);
 	return Response.json({
 		usage,
-		contextWindow: MODEL_CONTEXT_WINDOW,
+		contextWindow: usage?.contextWindow ?? info.value,
+		contextWindowSource: usage?.contextWindowSource ?? info.source,
 	});
 }

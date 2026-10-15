@@ -49,14 +49,22 @@ export function summarizeTemplate(t: {
 /** 处理 sourceImageNames → /api/uploads，返回 imageRefs */
 export async function uploadNamedImages(
 	names: string[] | undefined,
-	injected: Array<{ name: string; dataUrl: string }> | undefined,
+	injected: Array<{ name: string; dataUrl: string; imageId?: string }> | undefined,
 ): Promise<UploadedImageRef[]> {
 	if (!names?.length) return [];
-	const byName = new Map((injected ?? []).map((i) => [i.name, i.dataUrl]));
+	const byName = new Map((injected ?? []).map((i) => [i.name, i]));
 	const refs: UploadedImageRef[] = [];
+
+	// 附件阶段已落盘（占绝大多数）：直接复用 imageId，不再重复上传数百 KB
+	const pending: Array<{ name: string; dataUrl: string }> = [];
 	for (const name of names) {
-		const dataUrl = byName.get(name);
-		if (!dataUrl) continue;
+		const hit = byName.get(name);
+		if (!hit) continue;
+		if (hit.imageId) refs.push({ id: hit.imageId, name });
+		else pending.push({ name, dataUrl: hit.dataUrl });
+	}
+
+	for (const { name, dataUrl } of pending) {
 		const { image } = await apiFetch<{ image: UploadedImageRef }>("/api/uploads", {
 			method: "POST",
 			body: JSON.stringify({ dataUrl, fileName: name }),
@@ -80,7 +88,7 @@ const inputSchema = z.object({
 });
 
 export type SaveTemplateInput = z.infer<typeof inputSchema> & {
-	sourceImages?: Array<{ name: string; dataUrl: string }>;
+	sourceImages?: Array<{ name: string; dataUrl: string; imageId?: string }>;
 };
 
 export interface SaveTemplateOutput {

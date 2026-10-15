@@ -16,7 +16,7 @@ export const VISION_LLM_CONFIG = {
 	model: process.env.VISION_MODEL,
 } as const;
 
-export const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
+export const DEFAULT_MAX_OUTPUT_TOKENS = 16384;
 
 /**
  * 各模型的最大输出 token 数。
@@ -25,14 +25,14 @@ export const DEFAULT_MAX_OUTPUT_TOKENS = 65536;
  */
 const MAX_OUTPUT_TOKENS_MAP: Array<[RegExp, number]> = [
 	// GLM（智谱）
-	[/\bglm-4\.6v\b/i, 32768],
+	[/\bglm-4\.6v\b/i, 8192],
 	// DeepSeek
 	[/\bdeepseek-reasoner\b/i, 16384],
-	[/\bdeepseek/i, 65536],
+	[/\bdeepseek/i, 16384],
 	// Google Gemini
-	[/\bgemini-2\.5-pro\b/i, 65536],
-	[/\bgemini-2\.5-flash\b/i, 65536],
-	[/\bgemini-3/i, 65536],
+	[/\bgemini-2\.5-pro\b/i, 16384],
+	[/\bgemini-2\.5-flash\b/i, 16384],
+	[/\bgemini-3/i, 16384],
 	[/\bgemini-2/i, 8192],
 ];
 export const CHAT_API_ENDPOINT = "/api/chat";
@@ -79,15 +79,27 @@ const CONTEXT_WINDOW_MAP: Array<[RegExp, number]> = [
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
 
+export type ContextWindowSource = "env" | "model-map" | "default";
+
+export interface ContextWindowInfo {
+	value: number;
+	source: ContextWindowSource;
+}
+
 /** 根据模型名查找上下文窗口大小 */
 export function getContextWindow(model: string): number {
-	const envOverride = Number(process.env.NEXT_PUBLIC_MODEL_CONTEXT_WINDOW);
-	if (envOverride > 0) return envOverride;
+	return getContextWindowInfo(model).value;
+}
+
+/** 返回窗口大小及其来源，服务端优先使用非 NEXT_PUBLIC 的明确配置。 */
+export function getContextWindowInfo(model: string): ContextWindowInfo {
+	const envOverride = Number(process.env.MODEL_CONTEXT_WINDOW ?? process.env.NEXT_PUBLIC_MODEL_CONTEXT_WINDOW);
+	if (envOverride > 0) return { value: envOverride, source: "env" };
 
 	for (const [pattern, size] of CONTEXT_WINDOW_MAP) {
-		if (pattern.test(model)) return size;
+		if (pattern.test(model)) return { value: size, source: "model-map" };
 	}
-	return DEFAULT_CONTEXT_WINDOW;
+	return { value: DEFAULT_CONTEXT_WINDOW, source: "default" };
 }
 
 /** 根据模型名查找最大输出 token 数 */
@@ -96,6 +108,12 @@ export function getMaxOutputTokens(model: string): number {
 		if (pattern.test(model)) return size;
 	}
 	return DEFAULT_MAX_OUTPUT_TOKENS;
+}
+
+/** 模板视觉任务需要保留图片识别能力，但不应允许超长无效输出。 */
+export function getTaskMaxOutputTokens(model: string, isFormTask: boolean): number {
+	if (isFormTask) return Math.min(getMaxOutputTokens(model), 8192);
+	return Math.min(getMaxOutputTokens(model), 16384);
 }
 
 /** 当前主模型的上下文窗口大小 */

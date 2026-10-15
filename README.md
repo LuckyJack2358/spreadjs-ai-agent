@@ -78,6 +78,16 @@ AI 在不同模式下实际看到的工具数：
 - 会话和工作簿支持本地持久化，刷新页面或重新打开应用后可自动恢复上次活跃会话
 - MCP 管理支持用户自定义 MCP Server、动态工具发现和扩展式工作流接入
 
+## 会话上下文自动压缩
+
+长会话会不断累积历史消息，最终撞上上下文窗口（客户端在 95% 处直接硬停，用户只能新建会话、丢掉全部历史）。服务端因此新增压缩层（`lib/agent/context-compression.ts`），在 `convertToModelMessages` 之前把早期历史压成摘要，只把「摘要 + 最近若干轮原文」送给模型。
+
+- 触发：估算「系统提示 + 工具定义 + 全部消息」的 token 占用，超过上下文窗口 72% 才压缩，为输出与工具开销留出余量
+- 保留段：从尾部向前保留至少 4 条、且不少于保留预算（上限 24K token）的最近消息，切点对齐到 user 回合边界，保证工具调用与其结果不被拆开
+- 增量摘要：客户端回传 `{ summary, watermark }`，只把水位线之后、切点之前的消息追加进摘要，不重复摘要旧内容；摘要随会话一起持久化
+- 工具结果裁剪：保留段内较早的大体积 `read_ranges` 等结果替换为带预览的占位对象，填报/分派链路（`save_template` / `assign_template` / `propose_fill_data` / `submit_submission` 等）的结果原样保留
+- 降级与展示：摘要模型缺失、调用失败或超时都回退为「不压缩」，压缩本身绝不阻断对话；压缩状态经 `data-context-compacted` 送达前端，用量条改为按「摘要 + 保留段」估算，不再误触发硬停
+
 ## 单据模板化填报
 
 在原有「SpreadJS Designer + AI 聊天」之上叠加的一套三角色业务闭环。身份通过 cookie 切换（`sjs_uid`），无密码，首次访问默认落到 `admin`，方便直接演示。
@@ -99,7 +109,8 @@ AI 在不同模式下实际看到的工具数：
 ### 技术要点
 
 - 服务端数据层使用 Node 内置 `node:sqlite`（`DatabaseSync`），零原生依赖，首启自动建表 + 种子数据；表结构见 `lib/server/db.ts`（`users` / `templates` / `images` / `assignments` / `submissions`）
-- 图片经浏览器压缩（长边 ≤ 2000px、JPEG q0.8、单图上限 5MB）后以 data URL 提交，落盘到 `SJS_UPLOAD_DIR`，通过 `GET /api/uploads/[id]` 读取
+- 图片经浏览器压缩（长边 ≤ 2000px、JPEG q0.8、单图上限 5MB）后立即落盘到 `SJS_UPLOAD_DIR`（`POST /api/uploads`），通过 `GET /api/uploads/[id]` 读取
+- 消息历史里图片只保留 `/api/uploads/<id>` 轻量引用（IndexedDB 体积同步变小）；服务端仅在「最新一轮对话的前 2 个 step」把引用还原成真图发给视觉模型，历史轮与后续 step 自动降级为 uploadId 占位文本，避免同一张几百 KB 的图被反复搬运
 - 所有 Route Handler 运行在 Node runtime 并按角色鉴权：员工只能读写自己的任务与提交，管理员独占模板写入、分派、撤回与跨用户查询，越权返回 401/403
 - 工具与 System Prompt 按角色过滤：管理员 = 原有全部工具 + 管理类工具；员工 = 填报工具 + 只读的 `read_ranges`（不含网关与写入类工具）
 - 会话、自动保存与工作簿快照按 `userId` 隔离（会话 id 前缀 `u_<userId>_`、autosave key `current:<userId>`），切换身份时整页刷新，避免看到他人画布
@@ -110,7 +121,7 @@ AI 在不同模式下实际看到的工具数：
 pnpm test
 ```
 
-覆盖建表与种子、模板 CRUD 与同名覆盖 `version + 1`、字段地图 JSON 往返、重复分派拒绝、提交锁定、撤回后不可提交、权限矩阵与角色工具集过滤。
+覆盖建表与种子、模板 CRUD 与同名覆盖 `version + 1`、字段地图 JSON 往返、重复分派拒绝、提交锁定、撤回后不可提交、权限矩阵与角色工具集过滤，以及会话上下文压缩（阈值触发、保留段对齐、增量摘要、工具结果裁剪、失败回退）。
 
 ## 运行环境
 

@@ -6,6 +6,7 @@ export type ErrorSource =
 	| "chat/route"
 	| "chat/route/retry"
 	| "chat/stream"
+	| "chat/compaction"
 	| "debug/tool-call"
 	| "title/route"
 	| "tool/execute"

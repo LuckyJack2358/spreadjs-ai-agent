@@ -17,6 +17,10 @@ export interface SystemPromptContext {
 	role?: UserRole;
 	/** 填报模板上下文（模板名 + 字段地图 + assignmentId，由客户端注入） */
 	templateContext?: string;
+	/** 早期对话摘要（服务端上下文自动压缩产物，仅在本轮实际压缩时注入） */
+	historySummary?: string;
+	/** 模板生成阶段，由服务端控制工具边界 */
+	workflowPhase?: "inspect" | "build" | "verify" | "finalize";
 }
 
 type SectionBuilder = (ctx: SystemPromptContext) => string;
@@ -265,6 +269,31 @@ ${ctx.templateContext}`;
 };
 
 // ----------------------------------------------------------------------------
+// 11. 早期对话摘要（动态注入 · 上下文压缩产物）
+// ----------------------------------------------------------------------------
+const historySummarySection: SectionBuilder = (ctx) => {
+	if (!ctx.historySummary) return "";
+	return `## 早期对话摘要（上下文已自动压缩）
+
+由于会话过长，以下摘要替代了本次对话中较早的历史消息。请把它当作已确认的事实依据，与保留的最近对话一并使用：
+- 摘要中已记录的状态（工作簿内容、模板、分派、填报进度）视为当前状态
+- 摘要未覆盖的细节如需要，用工具重新读取确认，不要凭猜测补全
+
+${ctx.historySummary}`;
+};
+
+const formWorkflowSection: SectionBuilder = (ctx) => {
+	if (ctx.role !== "admin" || !ctx.workflowPhase) return "";
+	const instructions: Record<NonNullable<SystemPromptContext["workflowPhase"]>, string> = {
+		inspect: "识别空白单据图片的版式、字段名称和候选单元格位置。当前阶段只做读取和分析，不要写入工作簿，也不要保存模板。",
+		build: "根据已识别的字段和版式创建模板。使用工作簿写入、合并和格式工具完成布局；不要调用 save_template。",
+		verify: "读取关键区域核对字段地址、合并区域和布局。发现问题时回到写入工具修正；不要调用 save_template。",
+		finalize: "确认模板结构无误后调用一次 save_template 保存模板和字段地图。保存成功后停止，不要重复覆盖保存。",
+	};
+	return `## 当前模板生成阶段：${ctx.workflowPhase}\n\n${instructions[ctx.workflowPhase]}`;
+};
+
+// ----------------------------------------------------------------------------
 // 组装
 // ----------------------------------------------------------------------------
 
@@ -276,6 +305,8 @@ const sections: SectionBuilder[] = [
 	workbookState,
 	userModifications,
 	taskState,
+	historySummarySection,
+	formWorkflowSection,
 	toolUsage,
 	templateContextSection,
 	behavior,

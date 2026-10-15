@@ -14,13 +14,21 @@ import { saveWorkbook, loadWorkbook, clearWorkbook, hasAutoSaveData } from "@/li
 import { getDisplayName } from "@/lib/tools/registry";
 import { CHAT_API_ENDPOINT } from "@/lib/config";
 import {
+	getLatestCompactedState,
 	getPartState,
 	getPartText,
 	getTaskToolData,
 	isAppToolPart,
+	isContextCompactedPart,
+	isAgentProgressPart,
+	isReplyMetricsPart,
 	isRetryStatusPart,
 	isTaskToolPart,
 	type AppUIMessage,
+	type AppUIMessagePart,
+	type ContextCompactedData,
+	type AgentProgressData,
+	type ReplyMetrics,
 } from "@/lib/agent/ui-message";
 import { useAttachments } from "@/lib/hooks/useAttachments";
 import { useChatContext } from "@/lib/hooks/useChatContext";
@@ -33,9 +41,11 @@ import { useSheetInfo } from "@/lib/hooks/useSheetInfo";
 import { useServiceStatus } from "@/lib/hooks/useServiceStatus";
 import { useMcpServers } from "@/lib/hooks/useMcpServers";
 import { useContextUsage } from "@/lib/hooks/useContextUsage";
+import type { CompactionCarry } from "@/lib/agent/context-compression";
 import { SettingsPanel } from "@/components/settings-panel";
 import { useSettings } from "@/lib/hooks/useSettings";
 import { notifyFormDataChanged } from "@/lib/agent/form-context";
+import { subscribeSheetToChat, buildSheetChatPrompt } from "@/lib/agent/sheet-chat-bridge";
 import { useTheme } from "@/lib/hooks/useTheme";
 import { ServiceUnavailableBanner } from "@/components/ai-elements/service-unavailable-banner";
 import { PlusIcon, XIcon, FileIcon, ImageIcon, SparklesIcon, HistoryIcon, PaperclipIcon, Settings2Icon, WrenchIcon, RotateCcwIcon, GitBranchIcon, CopyIcon, PlayIcon, LoaderIcon, BrainIcon, PenLineIcon, AlertCircleIcon, CircleCheckIcon, ChevronDownIcon, PauseCircleIcon, MousePointerIcon } from "lucide-react";
@@ -101,12 +111,44 @@ interface MessageItemProps {
 	nextUserText?: string;
 	/** 特殊工具（确认卡等）渲染所需的外部上下文 */
 	extras?: SpecialToolExtras;
+	/** 该条 assistant 回复的持久化耗时 */
+	replyDurationMs?: number;
+	/** 该条 assistant 回复的运行指标 */
+	replyMetrics?: ReplyMetrics;
+	/** 当前正在生成的 assistant 回复起始时间 */
+	replyStartedAt?: number | null;
 }
 
-const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecision, isLast, status, sendMessage, hasSnapshot, onFork, nextUserText, extras }: MessageItemProps) {
+function formatReplyDuration(durationMs: number): string {
+	const totalSeconds = Math.max(0, durationMs) / 1000;
+	if (totalSeconds < 1) return `${totalSeconds.toFixed(1)}s`;
+	if (totalSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = Math.floor(totalSeconds % 60);
+	return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+}
+
+function ReplyDuration({ startedAt, durationMs, active = false }: { startedAt?: number | null; durationMs?: number; active?: boolean }) {
+	const [elapsed, setElapsed] = useState(() => durationMs ?? (startedAt ? Date.now() - startedAt : 0));
+
+	useEffect(() => {
+		if (!active || !startedAt) return;
+		const update = () => setElapsed(Math.max(0, Date.now() - startedAt));
+		update();
+		const timer = window.setInterval(update, 250);
+		return () => window.clearInterval(timer);
+	}, [active, durationMs, startedAt]);
+
+	if (!active && durationMs == null) return null;
+	const shownElapsed = active ? elapsed : (durationMs ?? elapsed);
+	return <span className="inline-flex items-center text-[11px] text-muted-foreground/70">{active ? "已用时 " : "耗时 "}{formatReplyDuration(shownElapsed)}</span>;
+}
+
+const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecision, isLast, status, sendMessage, hasSnapshot, onFork, nextUserText, extras, replyDurationMs, replyStartedAt, replyMetrics }: MessageItemProps) {
 	const lastTaskIdx = findLastTaskToolIndex(message.parts);
 	const showInlineThinking = isLast && message.role === "assistant" && status === "submitted";
 	const isUser = message.role === "user";
+	const isStreamingMessage = isLast && message.role === "assistant" && (status === "streaming" || status === "submitted");
 	// 中断标识：从消息本身读取，仅最后一条消息展示（避免历史中断消息误显示）
 	const isInterrupted = !!message.interrupted;
 	const showInterrupted = isInterrupted && isLast && !isUser;
@@ -184,7 +226,9 @@ const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecisi
 						}
 
 						if (part.type === "text" && part.text?.trim()) {
-							elements.push(<MessageResponse key={i}>{part.text}</MessageResponse>);
+							elements.push(isStreamingMessage
+								? <pre key={i} className="whitespace-pre-wrap break-words font-sans text-sm leading-relaxed">{part.text}</pre>
+								: <MessageResponse key={i}>{part.text}</MessageResponse>);
 						} else if (part.type === "reasoning" && part.text) {
 							// 过滤流式传输中可能残留的 <think> 标签
 							const cleaned = part.text.replace(/<\/?think>/g, "").trim();
@@ -219,6 +263,12 @@ const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecisi
 					flushMixed();
 					return elements;
 				})()}
+				{message.role === "assistant" && (isStreamingMessage || replyDurationMs != null) && (
+					<div className="mt-1 flex items-center gap-1.5">
+						<ReplyDuration startedAt={replyStartedAt} durationMs={replyDurationMs} active={isStreamingMessage} />
+						{replyMetrics && !isStreamingMessage && <span className="text-[11px] text-muted-foreground/60">{replyMetrics.steps} 步 · 模型 {formatReplyDuration(replyMetrics.modelDurationMs)} · 工具 {formatReplyDuration(replyMetrics.toolDurationMs)}</span>}
+					</div>
+				)}
 				{showInlineThinking && <ThinkingIndicator />}
 				{showInterrupted && (
 					<div className="flex items-center gap-1.5 pt-1 text-[11px] text-muted-foreground/50">
@@ -232,6 +282,8 @@ const MessageItem = memo(function MessageItem({ message, msgId, taskRenderDecisi
 	if (prev.message.id !== next.message.id) return false;
 	if (prev.isLast !== next.isLast) return false;
 	if (prev.hasSnapshot !== next.hasSnapshot) return false;
+	if (prev.replyDurationMs !== next.replyDurationMs) return false;
+	if (prev.replyMetrics !== next.replyMetrics) return false;
 	// 流式传输期间，最后一条消息始终重渲染以确保内容实时更新。
 	// AI SDK 可能对 message.parts 原地 mutation，导致 prevLast.text === nextLast.text
 	// （同一引用），memo 无法检测到文本增长，内容在流结束后才一次性显示。
@@ -319,6 +371,41 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const [showSettings, setShowSettings] = useState(false);
 	const [historyRefresh, setHistoryRefresh] = useState(0);
 	const [pendingAction, setPendingAction] = useState<{ message: string; action: () => void } | null>(null);
+	const [agentProgress, setAgentProgress] = useState<AgentProgressData | null>(null);
+	const [replyMetrics, setReplyMetrics] = useState<ReplyMetrics | null>(null);
+	const replyMetricsRef = useRef<ReplyMetrics | null>(null);
+	const [compacting, setCompacting] = useState(false);
+	const [compactionError, setCompactionError] = useState<string | null>(null);
+	const requestMetaRef = useRef<{
+		sessionId: string;
+		onRequestMeta: (meta: { requestId: string; runId: string }) => void;
+		compaction?: CompactionCarry | null;
+		agentPhase: AgentProgressData["phase"];
+		phaseStep: number;
+		totalStep: number;
+		workflowActive: boolean;
+	} | null>(null);
+	const currentRequestIdRef = useRef<string | null>(null);
+	const [currentRequestId, setCurrentRequestId] = useState<string | null>(null);
+	const agentPhaseRef = useRef<AgentProgressData["phase"]>("build");
+	const phaseStepRef = useRef(0);
+	const totalStepRef = useRef(0);
+	const workflowActiveRef = useRef(false);
+	const sessionWorkflowStateRef = useRef<{ active: boolean; phase: AgentProgressData["phase"]; phaseStep: number; totalStep: number } | undefined>(undefined);
+	const autoContinueRef = useRef<{ runId: string; phase: AgentProgressData["phase"] } | null>(null);
+	const lastAutoContinuedRunIdRef = useRef<string | null>(null);
+
+	requestMetaRef.current = {
+		sessionId: "",
+		onRequestMeta: ({ requestId }) => {
+			currentRequestIdRef.current = requestId;
+			setCurrentRequestId(requestId);
+		},
+		agentPhase: agentPhaseRef.current,
+		phaseStep: phaseStepRef.current,
+		totalStep: totalStepRef.current,
+		workflowActive: workflowActiveRef.current,
+	};
 
 	// MCP
 	const {
@@ -344,16 +431,20 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const [pendingAfterStop, setPendingAfterStop] = useState<string | null>(null);
 
 	// 会话管理
-	const { session, syncMessages, flushMessages, switchSession, newSession, onTitleChange, linkSnapshot, getSnapshotId, forkSession, saveTokenUsage } = useSession(userId);
+	const { session, syncMessages, flushMessages, switchSession, newSession, onTitleChange, linkSnapshot, getSnapshotId, forkSession, saveTokenUsage, saveReplyDuration, saveReplyMetrics, saveCompaction, saveWorkflowState } = useSession(userId);
+	requestMetaRef.current.sessionId = session.id;
+	requestMetaRef.current.compaction = session.compaction ?? null;
+	requestMetaRef.current.workflowActive = workflowActiveRef.current;
+	sessionWorkflowStateRef.current = session.workflowState;
 
 	// 提取的 hooks
-	const { pendingFiles, pendingFilesRef, fileInputRef, handleFileSelect, handleFileDrop, handlePaste, removePendingFile, consumePendingFile, consumePendingImageParts, collectImages, clearAttachments } = useAttachments({ visionAvailable });
+	const { pendingFiles, pendingFilesRef, imageIdsRef, fileInputRef, handleFileSelect, handleFileDrop, handlePaste, removePendingFile, consumePendingFile, consumePendingImageParts, collectImages, clearAttachments } = useAttachments({ visionAvailable });
 	const [isDragging, setIsDragging] = useState(false);
 	// 工作簿变更追踪：记录每次 HTTP 请求之间的所有 SpreadJS 变更
 	const { consume: consumeDirty } = useDirtyTracker(workbook);
-	const { buildBody } = useChatContext(workbook, consumeDirty, role);
+	const { buildBody } = useChatContext(workbook, consumeDirty, role, session.compaction ?? null, requestMetaRef);
 	const { confirmDialog, requestConfirm, onConfirmChoice } = useDestructiveGuard(settings.allowAllDestructive);
-	const { onToolCall, addToolOutputRef } = useToolDispatch(workbook, pendingFilesRef, requestConfirm, refreshSheetInfo);
+	const { onToolCall, addToolOutputRef } = useToolDispatch(workbook, pendingFilesRef, requestConfirm, refreshSheetInfo, imageIdsRef);
 
 	// 稳定引用：避免内联创建导致 useChat 每次重建触发 messages 无限 rerender
 	const transport = useMemo(
@@ -363,6 +454,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 
 	// 防止 agent 循环无限迭代（每次用户发消息重置计数器）
 	const autoStepCountRef = useRef(0);
+	const replyContinuationPendingRef = useRef(false);
 	const [stepLimitPaused, setStepLimitPaused] = useState(false);
 
 	const sendAutomaticallyWhen = useCallback((params: { messages: AppUIMessage[] }) => {
@@ -373,6 +465,11 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		const msgs = params.messages;
 		const last = msgs[msgs.length - 1];
 		if (last?.role === "assistant") {
+			const templateWasSaved = last.parts.some((part) => {
+				if (!isAppToolPart(part) || getToolName(part) !== "save_template" || part.state !== "output-available") return false;
+				return Boolean(part.output && typeof part.output === "object" && (part.output as { success?: unknown }).success === true);
+			});
+			if (templateWasSaved) return false;
 			const hasAskUser = last.parts.some(
 				(p) => isAppToolPart(p) && getToolName(p) === "ask_user" && p.state === "output-available",
 			);
@@ -396,14 +493,71 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 			setStepLimitPaused(true);
 			return false;
 		}
+		// 客户端工具（SpreadJS 操作）仍需把工具结果送回模型；若服务端阶段边界
+		// 同时要求续跑，则优先使用这次工具结果续跑，避免额外再发一条重复请求。
+		if (workflowActiveRef.current && currentRequestIdRef.current) {
+			lastAutoContinuedRunIdRef.current = currentRequestIdRef.current;
+			if (autoContinueRef.current?.runId === currentRequestIdRef.current) autoContinueRef.current = null;
+		}
 
+		replyContinuationPendingRef.current = true;
 		return true;
 	}, [settings.maxAutoSteps]);
+
+	// 服务端上下文自动压缩通知（transient data part）：持久化到当前会话，
+	// 下一次请求随 body 回传 summary + watermark，让服务端只摘要新增历史
+	const handleChatData = useCallback((part: AppUIMessagePart) => {
+		if (isContextCompactedPart(part)) {
+			saveCompaction(part.data);
+			setCompactionError(null);
+		}
+		if (isAgentProgressPart(part)) {
+			setAgentProgress(part.data);
+			if (part.data.phase !== agentPhaseRef.current && part.data.phaseStep === undefined) phaseStepRef.current = 0;
+			agentPhaseRef.current = part.data.phase;
+			if (part.data.phaseStep !== undefined) {
+				phaseStepRef.current = part.data.phaseStep;
+			} else if (part.data.phase === agentPhaseRef.current) {
+				phaseStepRef.current = Math.max(phaseStepRef.current, part.data.step);
+			}
+			if (part.data.totalStep !== undefined) totalStepRef.current = part.data.totalStep;
+			if (part.data.workflowActive !== undefined) workflowActiveRef.current = part.data.workflowActive;
+			if (part.data.autoContinue && lastAutoContinuedRunIdRef.current !== part.data.runId) {
+				autoContinueRef.current = { runId: part.data.runId, phase: part.data.phase };
+			} else if (part.data.autoContinue && lastAutoContinuedRunIdRef.current === part.data.runId) {
+				autoContinueRef.current = null;
+			} else if (part.data.autoContinue === false) {
+				autoContinueRef.current = null;
+			}
+			if (requestMetaRef.current) {
+				requestMetaRef.current.agentPhase = agentPhaseRef.current;
+				requestMetaRef.current.phaseStep = phaseStepRef.current;
+				requestMetaRef.current.totalStep = totalStepRef.current;
+				requestMetaRef.current.workflowActive = workflowActiveRef.current;
+			}
+			// 只在请求完成时落盘，避免每个进度事件都触发 IndexedDB 写入。
+			if (part.data.phaseStep !== undefined || part.data.autoContinue !== undefined) {
+				saveWorkflowState({
+					active: workflowActiveRef.current,
+					phase: agentPhaseRef.current,
+					phaseStep: phaseStepRef.current,
+					totalStep: totalStepRef.current,
+				});
+			}
+		}
+		if (isReplyMetricsPart(part)) {
+			replyMetricsRef.current = part.data;
+			setReplyMetrics(part.data);
+			currentRequestIdRef.current = part.data.requestId ?? currentRequestIdRef.current;
+			setCurrentRequestId(currentRequestIdRef.current);
+		}
+	}, [saveCompaction, saveWorkflowState]);
 
 	const { messages, sendMessage, addToolOutput, error, clearError, status, stop, setMessages } = useChat<AppUIMessage>({
 		transport,
 		sendAutomaticallyWhen,
 		onToolCall,
+		onData: handleChatData,
 	});
 
 	// 跨消息预计算：每个 planId 最后一次出现的位置，以及全局最后一个任务工具位置
@@ -451,6 +605,90 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const isGeneratingRef = useRef(isGenerating);
 	isGeneratingRef.current = isGenerating;
 
+	// 单轮回复计时：自动工具循环的 ready -> submitted 间隙不结束本轮，
+	// 只有稳定回到非生成状态后才落盘最终耗时。
+	const [replyStartedAt, setReplyStartedAt] = useState<number | null>(null);
+	const replyStartRef = useRef<number | null>(null);
+	const replyFinishTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+	const replyFinalizedMessageRef = useRef<string | null>(null);
+	const prevReplyGeneratingRef = useRef(false);
+
+	useEffect(() => {
+		if (isGenerating) {
+			replyContinuationPendingRef.current = false;
+			if (replyFinishTimerRef.current) {
+				clearTimeout(replyFinishTimerRef.current);
+				replyFinishTimerRef.current = null;
+			}
+			if (!replyStartRef.current) {
+				const started = Date.now();
+				replyStartRef.current = started;
+				setReplyStartedAt(started);
+				replyFinalizedMessageRef.current = null;
+			}
+			prevReplyGeneratingRef.current = true;
+			return;
+		}
+
+		const wasGenerating = prevReplyGeneratingRef.current;
+		if (replyContinuationPendingRef.current) return;
+		prevReplyGeneratingRef.current = false;
+		if (!wasGenerating || !replyStartRef.current) return;
+
+		if (replyFinishTimerRef.current) clearTimeout(replyFinishTimerRef.current);
+		const startedAt = replyStartRef.current;
+		const finalize = () => {
+			replyFinishTimerRef.current = null;
+			const assistant = [...messages].reverse().find((message) => message.role === "assistant");
+			if (assistant && replyFinalizedMessageRef.current !== assistant.id) {
+				const durationMs = Math.max(0, Date.now() - startedAt);
+				replyFinalizedMessageRef.current = assistant.id;
+				flushMessages();
+					saveReplyDuration(assistant.id, durationMs);
+					if (replyMetricsRef.current) saveReplyMetrics(assistant.id, replyMetricsRef.current);
+			}
+			replyStartRef.current = null;
+			setReplyStartedAt(null);
+		};
+		// 用户主动中断后可能马上发送下一条消息，先结束旧回复，避免两轮合并计时。
+		if (wasStoppedRef.current) {
+			finalize();
+		} else {
+			replyFinishTimerRef.current = setTimeout(finalize, 350);
+		}
+	}, [isGenerating, messages, flushMessages, saveReplyDuration, saveReplyMetrics]);
+
+	useEffect(() => () => {
+		if (replyFinishTimerRef.current) clearTimeout(replyFinishTimerRef.current);
+	}, []);
+
+	useEffect(() => {
+		if (replyFinishTimerRef.current) clearTimeout(replyFinishTimerRef.current);
+		replyFinishTimerRef.current = null;
+		replyStartRef.current = null;
+		replyFinalizedMessageRef.current = null;
+		prevReplyGeneratingRef.current = false;
+		setReplyStartedAt(null);
+		setReplyMetrics(null);
+		replyMetricsRef.current = null;
+		setAgentProgress(null);
+		setCurrentRequestId(null);
+		currentRequestIdRef.current = null;
+		const workflow = sessionWorkflowStateRef.current;
+		agentPhaseRef.current = workflow?.active ? workflow.phase : "build";
+		phaseStepRef.current = workflow?.active ? workflow.phaseStep : 0;
+		totalStepRef.current = workflow?.active ? workflow.totalStep : 0;
+		workflowActiveRef.current = workflow?.active ?? false;
+		if (requestMetaRef.current) {
+			requestMetaRef.current.agentPhase = agentPhaseRef.current;
+			requestMetaRef.current.phaseStep = phaseStepRef.current;
+			requestMetaRef.current.totalStep = totalStepRef.current;
+			requestMetaRef.current.workflowActive = workflowActiveRef.current;
+		}
+		autoContinueRef.current = null;
+		lastAutoContinuedRunIdRef.current = null;
+	}, [session.id]);
+
 	// 同步绑定 addToolOutput（ref 在 onToolCall 异步执行前已就绪）
 	addToolOutputRef.current = addToolOutput;
 
@@ -468,8 +706,15 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		stop();
 	}, [stop, setMessages]);
 
-	// 上下文 token 用量（跟随会话切换更新）
-	const contextUsage = useContextUsage(messages, toolCount, status, session.id, session.tokenUsage, saveTokenUsage);
+	// 服务端上下文自动压缩状态（优先取会话持久化值，兼容从消息 data part 回读）
+	const compaction = useMemo<ContextCompactedData | null>(
+		() => session.compaction ?? getLatestCompactedState(messages),
+		[session.compaction, messages],
+	);
+	const activeMetrics = replyMetrics ?? (messages.length ? session.replyMetrics?.[messages[messages.length - 1]?.id] ?? null : null);
+
+	// 上下文 token 用量（跟随会话切换更新；已压缩时按「摘要 + 保留段」估算）
+	const contextUsage = useContextUsage(messages, toolCount, status, session.id, session.tokenUsage, saveTokenUsage, compaction, currentRequestId);
 
 	// 重试进度：从最后一条 assistant 消息的 data-retry-status part 中提取
 	const retryStatus = useMemo(() => {
@@ -487,10 +732,48 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		return null;
 	}, [messages, status]);
 	// 上下文接近上限阈值
-	const CONTEXT_WARN_THRESHOLD = 80;
+	const CONTEXT_WARN_THRESHOLD = 70;
+	const CONTEXT_COMPACT_THRESHOLD = 85;
 	const CONTEXT_FULL_THRESHOLD = 95;
-	const contextNearLimit = contextUsage.percent >= CONTEXT_WARN_THRESHOLD && contextUsage.percent < CONTEXT_FULL_THRESHOLD;
+	// 已启用自动压缩：早期历史已换成摘要，不再要求用户新建会话
+	const contextCompacted = Boolean(compaction?.summary);
+	const contextNearLimit = contextUsage.percent >= CONTEXT_WARN_THRESHOLD && contextUsage.percent < CONTEXT_COMPACT_THRESHOLD;
+	const contextNeedsCompaction = contextUsage.percent >= CONTEXT_COMPACT_THRESHOLD;
 	const contextFull = contextUsage.percent >= CONTEXT_FULL_THRESHOLD;
+
+	const compactBeforeSend = useCallback(async (): Promise<boolean> => {
+		if (!contextNeedsCompaction) return true;
+		setCompacting(true);
+		setCompactionError(null);
+		try {
+			const res = await fetch("/api/chat/compact", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					sessionId: session.id,
+					messages,
+					role,
+					compaction: compaction ?? undefined,
+					force: true,
+				}),
+			});
+			if (!res.ok) throw new Error(`压缩请求失败（HTTP ${res.status}）`);
+			const data = await res.json() as { compacted?: boolean; state?: ContextCompactedData };
+			if (!data.compacted || !data.state) {
+				// 已有摘要但本轮没有新的可丢弃消息时，允许继续请求；服务端会继续使用现有水位线。
+				if (compaction?.summary) return true;
+				throw new Error("当前历史无法再压缩；可重试，或新建会话继续");
+			}
+			saveCompaction(data.state);
+			if (requestMetaRef.current) requestMetaRef.current.compaction = data.state;
+			return true;
+		} catch (e) {
+			setCompactionError(e instanceof Error ? e.message : "上下文压缩失败，可重试");
+			return false;
+		} finally {
+			setCompacting(false);
+		}
+	}, [contextNeedsCompaction, session.id, messages, role, compaction, saveCompaction]);
 
 	// 快照关联：保存待关联的 snapshotId，当新用户消息出现时与 messageId 绑定
 	const pendingSnapshotRef = useRef<string | null>(null);
@@ -501,7 +784,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const hasNotifiedNewSession = useRef(false);
 	useEffect(() => {
 		if (messages.length > 0) {
-			syncMessages(messages);
+			syncMessages(messages, isGenerating);
 
 			// 检测是否有新的用户消息，关联 pending snapshot
 			const userMessages = messages.filter((m) => m.role === "user");
@@ -518,7 +801,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				setHistoryRefresh((n) => n + 1);
 			}
 		}
-	}, [messages, syncMessages, linkSnapshot]);
+	}, [messages, isGenerating, syncMessages, linkSnapshot]);
 
 	// 标题生成完成时刷新历史列表
 	useEffect(() => {
@@ -635,6 +918,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		const text = pendingAfterStop;
 		setPendingAfterStop(null);
 		wasStoppedRef.current = false;
+		replyContinuationPendingRef.current = false;
 		autoStepCountRef.current = 0;
 		setStepLimitPaused(false);
 		ensureConnected().finally(() => {
@@ -706,6 +990,34 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		[],
 	);
 
+	// 服务端阶段预算结束后，自动发起下一阶段请求。
+	// 该续跑发生在上一条流完全结束之后，因此不会和 useChat 的工具自动循环重叠。
+	useEffect(() => {
+		if (status !== "ready") return;
+		const pending = autoContinueRef.current;
+		if (!pending || lastAutoContinuedRunIdRef.current === pending.runId || replyContinuationPendingRef.current) return;
+		if (wasStoppedRef.current || stepLimitPaused || !workflowActiveRef.current) return;
+
+		if (autoStepCountRef.current >= settings.maxAutoSteps) {
+			setStepLimitPaused(true);
+			return;
+		}
+
+		autoContinueRef.current = null;
+		lastAutoContinuedRunIdRef.current = pending.runId;
+		autoStepCountRef.current++;
+		replyContinuationPendingRef.current = true;
+		void ensureConnected().then(() => {
+			if (wasStoppedRef.current || !workflowActiveRef.current) {
+				replyContinuationPendingRef.current = false;
+				return;
+			}
+			stableSendMessageWithSnapshot({ text: "继续执行" });
+		}).catch(() => {
+			replyContinuationPendingRef.current = false;
+		});
+	}, [status, settings.maxAutoSteps, stepLimitPaused, ensureConnected, stableSendMessageWithSnapshot]);
+
 	// 步数上限暂停后，用户点击"继续执行"
 	const handleContinue = useCallback(() => {
 		autoStepCountRef.current = 0;
@@ -716,8 +1028,6 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 
 	const handleSubmit= useCallback(async (msg: { text: string }) => {
 		if (!msg.text.trim() && pendingFiles.length === 0) return;
-		// 上下文已满时拒绝发送
-		if (contextFull) return;
 		// AI 正在回复时，弹出中断确认对话框
 		if (isGeneratingRef.current) {
 			const text = msg.text.trim();
@@ -736,6 +1046,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		wasStoppedRef.current = false;
 		autoStepCountRef.current = 0;
 		setStepLimitPaused(false);
+		if (!(await compactBeforeSend())) return;
 		// 确保 MCP 连接存活（节流 60s），等待完成再发送消息
 		await ensureConnected();
 
@@ -756,7 +1067,21 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 
 		let text = msg.text.trim();
 
-		const imageParts = consumePendingImageParts();
+		// 图片已在此前的附件阶段落盘，这里拿到的是 /api/uploads/<id> 轻量引用
+		const imageParts = await consumePendingImageParts();
+		if (imageParts.length > 0 && role === "admin") {
+			agentPhaseRef.current = "inspect";
+			phaseStepRef.current = 0;
+			totalStepRef.current = 0;
+			workflowActiveRef.current = true;
+			if (requestMetaRef.current) {
+				requestMetaRef.current.agentPhase = "inspect";
+				requestMetaRef.current.phaseStep = 0;
+				requestMetaRef.current.totalStep = 0;
+				requestMetaRef.current.workflowActive = true;
+			}
+			saveWorkflowState({ active: true, phase: "inspect", phaseStep: 0, totalStep: 0 });
+		}
 		const fileTag = consumePendingFile();
 
 		if (imageParts.length > 0) {
@@ -778,7 +1103,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 
 		setInput("");
 	// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [pendingFiles, consumePendingFile, consumePendingImageParts, contextFull]);
+	}, [pendingFiles, consumePendingFile, consumePendingImageParts, compactBeforeSend, saveWorkflowState]);
 
 	const doNewSession = useCallback(() => {
 		handleStop();
@@ -845,6 +1170,14 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 			el.setSelectionRange(end, end);
 		});
 	}, []);
+
+	// 工作表标签右键「添加到对话」：只把提示词预填进输入框并聚焦，
+	// 交给用户补充问题后手动发送（与空态快捷提示同一套交互）。
+	useEffect(() => {
+		return subscribeSheetToChat((sheetName) => {
+			handleStarterInsert(buildSheetChatPrompt(sheetName));
+		});
+	}, [handleStarterInsert]);
 
 	const handleFork = useCallback(async (messageId: string, withRestore: boolean) => {
 		const doFork = async () => {
@@ -1084,6 +1417,9 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 									onFork={handleFork}
 									nextUserText={nextUserText}
 									extras={toolExtras}
+									replyDurationMs={session.replyDurations?.[message.id]}
+									replyMetrics={session.replyMetrics?.[message.id] ?? (msgIdx === messages.length - 1 && message.role === "assistant" ? activeMetrics ?? undefined : undefined)}
+									replyStartedAt={msgIdx === messages.length - 1 && message.role === "assistant" ? replyStartedAt : null}
 								/>
 							);
 						})
@@ -1113,7 +1449,10 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 										</p>
 									</div>
 								) : (
-									<ThinkingIndicator />
+									<div className="flex flex-col gap-1.5">
+										<ThinkingIndicator />
+										<ReplyDuration startedAt={replyStartedAt} active />
+									</div>
 								)}
 							</MessageContent>
 						</Message>
@@ -1127,6 +1466,33 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				<div className="flex items-center gap-2 border-t border-border/60 bg-muted/20 px-4 py-2">
 					<LoaderIcon className="size-3.5 animate-spin text-muted-foreground" />
 					<span className="text-xs text-muted-foreground">正在保存快照…</span>
+				</div>
+			)}
+
+			{isGenerating && agentProgress && (
+				<div className="flex items-center gap-2 border-t border-border/60 bg-muted/20 px-4 py-2">
+					<LoaderIcon className="size-3.5 animate-spin text-primary" />
+					<span className="text-xs text-muted-foreground">
+						{agentProgress.phase === "inspect" ? "识别单据" : agentProgress.phase === "build" ? "生成模板" : agentProgress.phase === "verify" ? "校验结构" : "保存结果"}
+						{agentProgress.step > 0 ? ` · 第 ${agentProgress.step} 步` : ""}
+						{` · 已用时 ${formatReplyDuration(agentProgress.elapsedMs)}`}
+						{agentProgress.toolName ? ` · ${getDisplayName(agentProgress.toolName)}` : ""}
+						{agentProgress.retry ? ` · 重试 ${agentProgress.retry.attempt}` : ""}
+					</span>
+				</div>
+			)}
+
+			{compacting && (
+				<div className="flex items-center gap-2 border-t border-sky-200/60 bg-sky-50/80 px-4 py-2 dark:border-sky-900/40 dark:bg-sky-950/30">
+					<LoaderIcon className="size-3.5 animate-spin text-sky-600" />
+					<span className="text-xs text-sky-700 dark:text-sky-400">正在压缩上下文并准备继续…</span>
+				</div>
+			)}
+			{compactionError && !compacting && (
+				<div className="flex items-center gap-2 border-t border-destructive/30 bg-destructive/5 px-4 py-2">
+					<AlertCircleIcon className="size-3.5 shrink-0 text-destructive" />
+					<span className="min-w-0 flex-1 truncate text-xs text-destructive" title={compactionError}>{compactionError}</span>
+					<button type="button" onClick={() => compactBeforeSend()} className="shrink-0 rounded-md bg-destructive px-2.5 py-1 text-xs font-medium text-destructive-foreground hover:bg-destructive/90">重试压缩</button>
 				</div>
 			)}
 
@@ -1153,6 +1519,16 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				</div>
 			)}
 
+			{/* 上下文已自动压缩提示（服务端把早期历史压成摘要后不再需要新建会话） */}
+			{contextCompacted && !isGenerating && contextUsage.percent >= CONTEXT_WARN_THRESHOLD && (
+				<div className="flex items-center gap-2 border-t border-sky-200/60 dark:border-sky-900/40 bg-sky-50/80 dark:bg-sky-950/30 px-4 py-2">
+					<SparklesIcon className="size-4 shrink-0 text-sky-600 dark:text-sky-400" />
+					<span className="text-xs text-sky-700 dark:text-sky-400 flex-1">
+						会话历史已自动压缩为摘要（保留最近对话），可继续对话 · 当前占用 {contextUsage.percent}%
+					</span>
+				</div>
+			)}
+
 			{/* 上下文接近上限警告 */}
 			{contextNearLimit && !isGenerating && (
 				<div className="flex items-center gap-2 border-t border-amber-200/60 dark:border-amber-900/40 bg-amber-50/80 dark:bg-amber-950/30 px-4 py-2">
@@ -1171,21 +1547,14 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				</div>
 			)}
 
-			{/* 上下文已达上限，禁止继续对话 */}
+			{/* 上下文达到警戒线：发送前会自动压缩，不再直接阻断输入 */}
 			{contextFull && !isGenerating && (
 				<div className="flex items-center gap-2 border-t border-destructive/30 bg-destructive/8 px-4 py-2">
 					<AlertCircleIcon className="size-4 shrink-0 text-destructive" />
 					<span className="text-xs text-destructive flex-1">
-						上下文已达上限（{contextUsage.percent}%），请新建会话继续对话
+						上下文占用已达 {contextUsage.percent}% ，下次发送前将自动压缩；压缩失败时可重试或新建会话
 					</span>
-					<button
-						type="button"
-						onClick={handleNewSession}
-						className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-1 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90"
-					>
-						<PlusIcon className="size-3" />
-						新建会话
-					</button>
+					{compactionError && <button type="button" onClick={() => compactBeforeSend()} className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-1 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90">重试</button>}
 				</div>
 			)}
 
@@ -1271,8 +1640,8 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 						value={input}
 						onChange={(e) => setInput(e.target.value)}
 						onPaste={handlePaste}
-						placeholder={contextFull ? "上下文已达上限，请新建会话继续对话" : isReady ? "输入指令，如「在A1写入Hello」..." : "SpreadJS 加载中..."}
-						disabled={!isReady || contextFull}
+						placeholder={compacting ? "正在压缩上下文…" : isReady ? "输入指令，如「在A1写入Hello」..." : "SpreadJS 加载中..."}
+						disabled={!isReady || compacting}
 					/>
 					<PromptInputFooter>
 						<div className="flex items-center gap-1.5">
@@ -1290,12 +1659,26 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 							<span className="text-[11px] leading-tight text-right text-muted-foreground/60 whitespace-pre-line">
 								{isGenerating ? "Esc 中断" : "Enter 发送\nShift+Enter 换行"}
 							</span>
+							{contextCompacted && (
+								<TooltipProvider>
+									<Tooltip>
+										<TooltipTrigger asChild>
+											<span className="cursor-default rounded-sm bg-sky-100 px-1 py-0.5 text-[10px] font-medium leading-none text-sky-700 dark:bg-sky-950/50 dark:text-sky-400">
+												已压缩
+											</span>
+										</TooltipTrigger>
+										<TooltipContent side="top" className="max-w-[260px]">
+											早期对话已自动压缩为摘要（保留了目标、工具结果与关键状态），可继续对话。
+										</TooltipContent>
+									</Tooltip>
+								</TooltipProvider>
+							)}
 							<ContextUsageIndicator usage={contextUsage} visible={settings.showContextUsage} />
 							<div className="flex items-center">
 								<PromptInputSubmit
 									status={status}
 									onStop={handleStop}
-									disabled={!isGenerating && (!isReady || (!input.trim() && pendingFiles.length === 0) || contextFull)}
+								disabled={!isGenerating && (compacting || !isReady || (!input.trim() && pendingFiles.length === 0))}
 									className={isGenerating && currentReplySnapshotId ? "rounded-r-none border-r-0" : ""}
 								/>
 								{isGenerating && currentReplySnapshotId && (

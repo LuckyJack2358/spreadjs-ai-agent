@@ -7,6 +7,12 @@
 export const MAX_IMAGE_EDGE = 2000;
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 export const JPEG_QUALITY = 0.8;
+/**
+ * 原图直传的体积上限（字节）。
+ * 单据照片/截图常在 1~5MB，原图直传后 base64 会膨胀 33%，而且 agent 每一步都要重发整段历史，
+ * 因此超过该体积一律重编码为 JPEG，把单图压到几百 KB。
+ */
+export const MAX_PASSTHROUGH_BYTES = 1024 * 1024;
 
 export interface PreparedImage {
 	/** 可直接用于 preview / 上传的 data URL */
@@ -85,8 +91,10 @@ export async function compressImageFile(file: File): Promise<PreparedImage> {
 	try {
 		const longEdge = Math.max(width, height);
 		const needScale = longEdge > MAX_IMAGE_EDGE;
-		// 已足够小：保持原始字节（避免不必要的画质损失）
-		if (!needScale && file.size <= MAX_IMAGE_BYTES) {
+		// 体积偏大同样要重编码（否则原图几 MB 直传）
+		const needReencode = file.size > MAX_PASSTHROUGH_BYTES;
+		// 尺寸和体积都已足够小：保持原始字节（避免不必要的画质损失）
+		if (!needScale && !needReencode) {
 			const dataUrl = await readAsDataUrl(file);
 			return {
 				dataUrl,
@@ -112,12 +120,10 @@ export async function compressImageFile(file: File): Promise<PreparedImage> {
 		ctx.fillRect(0, 0, targetW, targetH);
 		ctx.drawImage(bitmap as CanvasImageSource, 0, 0, targetW, targetH);
 
-		// PNG 截图（无缩放需求且体积可控）保留无损画质，其余统一转 JPEG
-		const keepPng = !needScale && file.type === "image/png";
-		const mimeType = keepPng ? "image/png" : "image/jpeg";
-		const quality = keepPng ? undefined : JPEG_QUALITY;
+		// 走到这里说明尺寸超限或体积超限，统一转 JPEG（q0.8）
+		const mimeType = "image/jpeg";
 
-		let blob = await canvasToBlob(canvas, mimeType, quality ?? JPEG_QUALITY);
+		let blob = await canvasToBlob(canvas, mimeType, JPEG_QUALITY);
 		// 质量仍超标时逐级降质，保证最终 ≤ 5MB
 		let q = JPEG_QUALITY;
 		while (blob.size > MAX_IMAGE_BYTES && q > 0.4) {

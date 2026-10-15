@@ -10,8 +10,8 @@ const inputSchema = z.object({
 });
 
 export interface SubmitSubmissionInput extends z.infer<typeof inputSchema> {
-	/** 由前端派发层注入：imageNames 对应的 data URL */
-	images?: Array<{ name: string; dataUrl: string }>;
+	/** 由前端派发层注入：imageNames 对应的 data URL（已落盘的带 imageId，可复用不重复上传） */
+	images?: Array<{ name: string; dataUrl: string; imageId?: string }>;
 }
 
 export interface SubmitSubmissionOutput {

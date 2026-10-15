@@ -3,11 +3,14 @@
 import { useRef, useState, useCallback } from "react";
 import type { FileUIPart } from "ai";
 import { compressImageFile } from "@/lib/image/compress";
+import { uploadUrlFor } from "@/lib/agent/image-ref";
 
 /** 单据图附件（确认卡提交时按名字取用） */
 export interface PendingImageRef {
 	name: string;
 	dataUrl: string;
+	/** 附件阶段已落盘拿到的 imageId（用于复用，避免二次上传大图） */
+	imageId?: string;
 }
 
 export interface PendingFile {
@@ -25,6 +28,10 @@ export interface PendingFile {
  * 从 ChatPanel 提取，职责单一化。
  * 支持两类附件：电子表格文件（xlsx/csv/sjs）和图片文件（png/jpg/gif/webp）。
  * 支持同时暂存多个文件（多张图片、多个电子表格、或混合）。
+ *
+ * 图片额外做一件事：压缩后立即 POST /api/uploads 落盘，消息历史里只保留
+ * `/api/uploads/<imageId>` 轻量引用（详见 lib/agent/image-ref.ts），
+ * data URL 仍留在内存 ref 中供预览与 save_template / submit_submission 使用。
  */
 const SPREADSHEET_EXTENSIONS = [".xlsx", ".csv", ".sjs", ".ssjson", ".json"];
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
@@ -83,12 +90,33 @@ function mimeToExt(mime: string): string {
 	return "png";
 }
 
+/** 把压缩后的图片落盘，返回 imageId；失败返回 null（回落为内联 data URL） */
+async function uploadImageToServer(fileName: string, dataUrl: string): Promise<string | null> {
+	try {
+		const res = await fetch("/api/uploads", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ dataUrl, fileName }),
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const body = (await res.json()) as { image?: { id?: string } };
+		return body.image?.id ?? null;
+	} catch (e) {
+		console.warn("[useAttachments] 图片入库失败，本轮改为内联 data URL:", e);
+		return null;
+	}
+}
+
 export function useAttachments(options?: { visionAvailable?: boolean }) {
 	const visionAvailable = options?.visionAvailable ?? true;
 	const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
 	const pendingFilesRef = useRef(new Map<string, string>());
 	/** 仅图片：name → data URL（发送后仍保留，供 save_template / submit_submission 按名取用） */
 	const imageDataUrlsRef = useRef(new Map<string, string>());
+	/** 仅图片：name → 落盘 Promise<imageId|null>（发送时 await，拿不到就回落 data URL） */
+	const imageUploadsRef = useRef(new Map<string, Promise<string | null>>());
+	/** 仅图片：name → 已落盘的 imageId（确认卡/工具复用，避免重复上传大图） */
+	const imageIdsRef = useRef(new Map<string, string>());
 	const fileInputRef = useRef<HTMLInputElement>(null);
 	const pasteCounterRef = useRef(0);
 
@@ -113,6 +141,15 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 			// 同步存入 ref，供 add_picture 工具自动注入（镜像 import_file 模式）
 			pendingFilesRef.current.set(file.name, dataUrl);
 			imageDataUrlsRef.current.set(file.name, dataUrl);
+			// 落盘：拿到 imageId 后消息历史里只带引用，不再每轮重发数百 KB 的 data URL
+			const upload = uploadImageToServer(file.name, dataUrl).then((imageId) => {
+				// 附件已被移除（或同名文件已被替换）时不要回填
+				if (imageId && pendingFilesRef.current.get(file.name) === dataUrl) {
+					imageIdsRef.current.set(file.name, imageId);
+				}
+				return imageId;
+			});
+			imageUploadsRef.current.set(file.name, upload);
 			setPendingFiles(prev => [...prev, {
 				name: file.name,
 				size,
@@ -173,17 +210,23 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 				// 无论是电子表格还是图片，都从 ref 中移除
 				pendingFilesRef.current.delete(file.name);
 				imageDataUrlsRef.current.delete(file.name);
+				imageUploadsRef.current.delete(file.name);
+				imageIdsRef.current.delete(file.name);
 			}
 			return prev.filter((_, i) => i !== index);
 		});
 	}, []);
 
 	/**
-	 * 收集当前仍可用的单据图（name + data URL）。
+	 * 收集当前仍可用的单据图（name + data URL + 已落盘的 imageId）。
 	 * 发送后不清空，因此确认卡/工具可在后续轮次按文件名取用。
 	 */
 	const collectImages = useCallback((): PendingImageRef[] => {
-		return Array.from(imageDataUrlsRef.current, ([name, dataUrl]) => ({ name, dataUrl }));
+		return Array.from(imageDataUrlsRef.current, ([name, dataUrl]) => ({
+			name,
+			dataUrl,
+			imageId: imageIdsRef.current.get(name),
+		}));
 	}, []);
 
 	/**
@@ -202,17 +245,23 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 	/**
 	 * 消费暂存图片附件（发送消息时调用）。
 	 * 返回 AI SDK FileUIPart 数组，可直接传给 sendMessage({ files: [...] })。
+	 * 优先使用已落盘的 imageId 生成轻量引用 URL；落盘失败/未完成时回落为内联 data URL。
 	 * 若无图片附件则返回空数组。
 	 */
-	const consumePendingImageParts = useCallback((): FileUIPart[] => {
+	const consumePendingImageParts = useCallback(async (): Promise<FileUIPart[]> => {
 		const images = pendingFiles.filter(f => f.fileType === "image" && f.dataUrl);
 		if (images.length === 0) return [];
-		const parts: FileUIPart[] = images.map(f => ({
-			type: "file" as const,
-			mediaType: f.mediaType ?? "image/jpeg",
-			filename: f.name,
-			url: f.dataUrl!,
-		}));
+		const parts: FileUIPart[] = [];
+		for (const f of images) {
+			const pending = imageUploadsRef.current.get(f.name);
+			const imageId = (pending ? await pending.catch(() => null) : null) ?? imageIdsRef.current.get(f.name) ?? null;
+			parts.push({
+				type: "file" as const,
+				mediaType: f.mediaType ?? "image/jpeg",
+				filename: f.name,
+				url: imageId ? uploadUrlFor(imageId) : f.dataUrl!,
+			});
+		}
 		setPendingFiles(prev => prev.filter(f => f.fileType !== "image"));
 		return parts;
 	}, [pendingFiles]);
@@ -222,6 +271,8 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 		setPendingFiles([]);
 		pendingFilesRef.current.clear();
 		imageDataUrlsRef.current.clear();
+		imageUploadsRef.current.clear();
+		imageIdsRef.current.clear();
 		pasteCounterRef.current = 0;
 	}, []);
 
@@ -229,6 +280,7 @@ export function useAttachments(options?: { visionAvailable?: boolean }) {
 		pendingFiles,
 		pendingFilesRef,
 		imageDataUrlsRef,
+		imageIdsRef,
 		fileInputRef,
 		handleFileSelect,
 		handleFileDrop,

@@ -15,6 +15,44 @@ export interface RetryStatusData {
 	reason: string;
 }
 
+export type AgentPhase = "inspect" | "build" | "verify" | "finalize";
+
+export interface AgentProgressData {
+	runId: string;
+	requestId: string;
+	phase: AgentPhase;
+	step: number;
+	phaseStep?: number;
+	totalStep?: number;
+	elapsedMs: number;
+	toolName?: string;
+	toolElapsedMs?: number;
+	retry?: { attempt: number; reason: string; delayMs?: number };
+	/** 阶段边界/当前请求完成后，客户端可自动进入下一阶段继续运行。 */
+	autoContinue?: boolean;
+	workflowActive?: boolean;
+}
+
+/**
+ * 服务端上下文自动压缩通知。
+ * 由 `/api/chat` 在压缩生效时以 data part 下发，前端持久化到会话，
+ * 并在下一次请求时回传 summary + watermark 做增量摘要。
+ */
+export interface ContextCompactedData {
+	/** 累积摘要正文（已压缩的早期对话） */
+	summary: string;
+	/** 摘要覆盖到的最后一条消息 id（水位线） */
+	watermark: string;
+	/** 本次压缩后保留原文的起始消息 id（供前端估算上下文占用） */
+	keptFromMessageId?: string;
+	/** 摘要部分的估算 token */
+	summaryTokens?: number;
+	/** 被压缩掉的消息条数 */
+	droppedCount?: number;
+	/** 压缩发生时间（用于提示条去重/关闭） */
+	updatedAt?: number;
+}
+
 export interface AddTasksInput {
 	tasks: Array<{
 		id: string;
@@ -75,7 +113,25 @@ export interface ProposeFillDataOutputData {
 
 export type AppDataParts = Record<string, unknown> & {
 	"retry-status": RetryStatusData;
+	"context-compacted": ContextCompactedData;
+	"agent-progress": AgentProgressData;
+	"reply-metrics": ReplyMetrics;
 };
+
+export interface ReplyMetrics {
+	totalDurationMs: number;
+	modelDurationMs: number;
+	toolDurationMs: number;
+	steps: number;
+	retries: number;
+	compacted: boolean;
+	model: string;
+	provider: string;
+	contextWindow: number;
+	contextWindowSource?: "env" | "model-map" | "default";
+	runId?: string;
+	requestId?: string;
+}
 
 type AppToolName = BuiltinToolName | "take_screenshot";
 
@@ -124,6 +180,18 @@ export type RetryStatusPart = {
 	data: RetryStatusData;
 };
 
+export type AgentProgressPart = {
+	type: "data-agent-progress";
+	id?: string;
+	data: AgentProgressData;
+};
+
+export type ReplyMetricsPart = {
+	type: "data-reply-metrics";
+	id?: string;
+	data: ReplyMetrics;
+};
+
 export function isAppToolPart(part: AppUIMessagePart): part is AppToolUIPart {
 	return isToolUIPart(part);
 }
@@ -149,6 +217,36 @@ export function getProposeFillDataOutputData(part: ProposeFillDataToolPart): Pro
 
 export function isRetryStatusPart(part: AppUIMessagePart): part is RetryStatusPart {
 	return isDataUIPart(part) && part.type === "data-retry-status";
+}
+
+export function isAgentProgressPart(part: AppUIMessagePart): part is AgentProgressPart {
+	return isDataUIPart(part) && part.type === "data-agent-progress";
+}
+
+export function isReplyMetricsPart(part: AppUIMessagePart): part is ReplyMetricsPart {
+	return isDataUIPart(part) && part.type === "data-reply-metrics";
+}
+
+export type ContextCompactedPart = {
+	type: "data-context-compacted";
+	id?: string;
+	data: ContextCompactedData;
+};
+
+export function isContextCompactedPart(part: AppUIMessagePart): part is ContextCompactedPart {
+	return isDataUIPart(part) && part.type === "data-context-compacted";
+}
+
+/** 从消息历史中取出最近一次上下文压缩状态 */
+export function getLatestCompactedState(messages: AppUIMessage[]): ContextCompactedData | null {
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const parts = messages[i].parts;
+		for (let j = parts.length - 1; j >= 0; j--) {
+			const part = parts[j];
+			if (isContextCompactedPart(part)) return part.data;
+		}
+	}
+	return null;
 }
 
 export function getAppToolName(part: AppToolUIPart): string {

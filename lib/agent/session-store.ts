@@ -1,5 +1,6 @@
-import type { AppUIMessage } from "@/lib/agent/ui-message";
+import type { AppUIMessage, ContextCompactedData, ReplyMetrics } from "@/lib/agent/ui-message";
 import type { TaskPlan } from "@/lib/agent/task-types";
+import { parseUploadId } from "@/lib/agent/image-ref";
 
 // ============================================================================
 // 会话历史存储 — 基于 IndexedDB 的本地持久化
@@ -14,7 +15,23 @@ export interface Session {
 	/** 会话级任务计划列表，支持多计划历史 */
 	taskPlans?: TaskPlan[];
 	/** 最近一次 AI 回复后的真实 token 用量（用于切换会话时恢复上下文用量显示） */
-	tokenUsage?: { promptTokens: number; contextWindow: number };
+	tokenUsage?: {
+		promptTokens: number;
+		contextWindow: number;
+		model?: string;
+		contextWindowSource?: "env" | "model-map" | "default";
+	};
+	/** assistantMessageId → 本轮 AI 回复耗时（毫秒），用于历史会话恢复展示 */
+	replyDurations?: Record<string, number>;
+	replyMetrics?: Record<string, ReplyMetrics>;
+	/** 服务端上下文自动压缩状态（累积摘要 + 水位线，下一次请求回传给服务端做增量摘要） */
+	compaction?: ContextCompactedData;
+	workflowState?: {
+		active: boolean;
+		phase: "inspect" | "build" | "verify" | "finalize";
+		phaseStep: number;
+		totalStep: number;
+	};
 	createdAt: number;
 	updatedAt: number;
 }
@@ -33,6 +50,90 @@ const STORE_NAME = "sessions";
 export const PAGE_SIZE = 50;
 
 let dbPromise: Promise<IDBDatabase> | null = null;
+
+const PERSISTED_TOOL_OUTPUT_LIMIT = 6_000;
+const PERSISTED_PREVIEW_LIMIT = 900;
+const IMPORTANT_PERSISTED_TOOLS = new Set([
+	"save_template",
+	"assign_template",
+	"propose_fill_data",
+	"submit_submission",
+	"load_template",
+	"list_my_assignments",
+	"ask_user",
+	"add_tasks",
+	"complete_task",
+]);
+
+function stripLargeImageValues(value: unknown): unknown {
+	if (typeof value === "string") {
+		if (value.startsWith("data:image/")) return "[image data omitted; uploadId retained when available]";
+		return value;
+	}
+	if (Array.isArray(value)) return value.map((item) => stripLargeImageValues(item));
+	if (!value || typeof value !== "object") return value;
+	const output: Record<string, unknown> = {};
+	for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+		if ((childKey === "dataUrl" || childKey === "imageBase64") && typeof childValue === "string") {
+			output[childKey] = "[image omitted]";
+			continue;
+		}
+		output[childKey] = stripLargeImageValues(childValue);
+	}
+	return output;
+}
+
+function compactToolOutput(output: unknown): unknown {
+	if (output && typeof output === "object" && !Array.isArray(output)) {
+		const candidate = output as { type?: unknown; value?: unknown };
+		if (candidate.type === "content" && Array.isArray(candidate.value)) {
+			return {
+				type: "content",
+				value: candidate.value.map((part) => {
+					if (part && typeof part === "object" && (part as { type?: unknown }).type === "media") {
+						return { type: "text", text: "[截图已省略，原结果包含图片媒体]" };
+					}
+					return stripLargeImageValues(part);
+				}),
+			};
+		}
+	}
+	const cleaned = stripLargeImageValues(output);
+	let serialized = "";
+	try { serialized = JSON.stringify(cleaned) ?? ""; } catch { serialized = String(cleaned); }
+	if (serialized.length <= PERSISTED_TOOL_OUTPUT_LIMIT) return cleaned;
+	return {
+		truncated: true,
+		note: "工具结果已裁剪，仅保留持久化预览",
+		originalChars: serialized.length,
+		preview: serialized.slice(0, PERSISTED_PREVIEW_LIMIT),
+	};
+}
+
+/** 只压缩 IndexedDB 副本；运行中的 messages 保持完整，避免影响当前 UI 与工具流程。 */
+export function compactPersistedMessages(messages: AppUIMessage[]): AppUIMessage[] {
+	return messages.map((message) => ({
+		...message,
+		parts: message.parts.map((part) => {
+			if (part.type === "file") {
+				const imageId = parseUploadId(part.url);
+				return {
+					...part,
+					url: imageId ? part.url : "[image data omitted]",
+				};
+			}
+			if (part.type !== "dynamic-tool" && !String(part.type).startsWith("tool-")) {
+				return part;
+			}
+			const toolName = part.type === "dynamic-tool" ? part.toolName : String(part.type).slice(5);
+			const next = { ...part } as Record<string, unknown>;
+			if ("input" in next) next.input = stripLargeImageValues(next.input);
+			if ("output" in next && !IMPORTANT_PERSISTED_TOOLS.has(toolName)) next.output = compactToolOutput(next.output);
+			else if ("output" in next) next.output = stripLargeImageValues(next.output);
+			return next as typeof part;
+		}),
+	}));
+}
 
 function openDB(): Promise<IDBDatabase> {
 	if (dbPromise) return dbPromise;
@@ -61,7 +162,11 @@ function promisify<T>(req: IDBRequest<T>): Promise<T> {
 export async function saveSession(session: Session): Promise<void> {
 	const db = await openDB();
 	const tx = db.transaction(STORE_NAME, "readwrite");
-	await promisify(tx.objectStore(STORE_NAME).put(session));
+	const persisted: Session = {
+		...session,
+		messages: compactPersistedMessages(session.messages),
+	};
+	await promisify(tx.objectStore(STORE_NAME).put(persisted));
 }
 
 export async function getSession(id: string): Promise<Session | undefined> {

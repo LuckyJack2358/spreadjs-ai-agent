@@ -9,6 +9,7 @@ import {
 import { cn } from "@/lib/utils";
 import { BrainIcon, ChevronRightIcon } from "lucide-react";
 import { MessageResponse } from "./message";
+import { truncateText } from "@/lib/text-limit";
 
 interface ReasoningBlockProps {
 	text: string;
@@ -44,6 +45,13 @@ export const ReasoningBlock = memo(function ReasoningBlock({ text: rawText, stat
 	}, [state, interrupted]);
 
 	if (!text) return null;
+
+	// 超长思考文本只渲染开头片段：
+	// 1) 流式期间把 10 万字符持续写进 <pre>，浏览器每帧都要为整段重新断行（Chromium 实测 ~128ms/增量），
+	//    表现为「上传图片后界面卡死」；只渲染开头片段时首段之后 DOM 完全不再变化，降到 ~0.7ms/增量。
+	// 2) 渲染完成后再走 markdown 解析同样昂贵（实测 10 万字符 ~0.6s、整段思考 ~1.1s），超长时直接用 <pre>。
+	const { text: displayText, truncated, omitted } = truncateText(text);
+	const usePlainText = isStreaming || truncated;
 
 	const triggerLabel = interrupted
 		? "思考已中断"
@@ -93,10 +101,15 @@ export const ReasoningBlock = memo(function ReasoningBlock({ text: rawText, stat
 						role="region"
 						aria-label="推理内容"
 					>
-						{isStreaming ? (
-							<pre className="whitespace-pre-wrap font-sans">{text}</pre>
+						{usePlainText ? (
+							<pre className="whitespace-pre-wrap font-sans">{displayText}</pre>
 						) : (
 							<MessageResponse>{text}</MessageResponse>
+						)}
+						{truncated && (
+							<p className="mt-1.5 text-[11px] text-muted-foreground/45">
+								…… 已省略 {omitted} 字（完整思考仍保存在会话记录中）
+							</p>
 						)}
 					</div>
 				</div>

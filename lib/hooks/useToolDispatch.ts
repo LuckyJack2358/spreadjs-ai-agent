@@ -34,8 +34,28 @@ const AGENT_TOOLS = new Set([
 	"propose_fill_data",
 ]);
 
-/** 工具执行超时（ms），防止 handler hang 导致 agent 循环永久卡死 */
-const TOOL_TIMEOUT_MS = 60_000;
+/** 只读 SpreadJS 工具短超时；写入与服务端工具使用更宽松的统一预算。 */
+const READ_ONLY_TOOL_NAMES = new Set([
+	"read_ranges",
+	"get_workbook_metadata",
+	"get_all_objects",
+	"get_cell_format",
+	"trace_dependencies",
+	"search_data",
+	"get_table_info",
+	"get_comments",
+	"get_validation",
+	"get_cell_states",
+	"get_cell_type",
+	"get_hyperlinks",
+	"get_comments",
+]);
+
+export function getToolTimeoutMs(toolName: string): number {
+	if (READ_ONLY_TOOL_NAMES.has(toolName)) return 15_000;
+	if (toolName.startsWith("mcp__") || isServerTool(toolName)) return 30_000;
+	return 30_000;
+}
 
 function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Promise<T> {
 	return new Promise((resolve, reject) => {
@@ -50,15 +70,21 @@ function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Prom
 	});
 }
 
-/** 按文件名从暂存区取出图片 data URL（缺失的静默跳过，由工具/服务端报错兜底） */
+/**
+ * 按文件名从暂存区取出图片（缺失的静默跳过，由工具/服务端报错兜底）。
+ * 附件阶段已落盘的图片会带上 imageId，工具侧可直接复用，避免二次上传数百 KB。
+ */
 function pickImages(
 	store: Map<string, string> | null | undefined,
 	names: string[],
-): Array<{ name: string; dataUrl: string }> {
-	const out: Array<{ name: string; dataUrl: string }> = [];
+	imageIds?: Map<string, string> | null,
+): Array<{ name: string; dataUrl: string; imageId?: string }> {
+	const out: Array<{ name: string; dataUrl: string; imageId?: string }> = [];
 	for (const name of names) {
 		const dataUrl = store?.get(name);
-		if (dataUrl) out.push({ name, dataUrl });
+		if (!dataUrl) continue;
+		const imageId = imageIds?.get(name);
+		out.push(imageId ? { name, dataUrl, imageId } : { name, dataUrl });
 	}
 	return out;
 }
@@ -335,6 +361,8 @@ export function useToolDispatch(
 	pendingFilesRef: React.RefObject<Map<string, string>>,
 	requestConfirm: (p: ConfirmRequest) => Promise<boolean>,
 	onAfterExecuteCode?: () => void,
+	/** 附件阶段已落盘的图片：name → imageId（可选，用于复用避免重复上传） */
+	imageIdsRef?: React.RefObject<Map<string, string>>,
 ) {
 	const addToolOutputRef = useRef<AddToolOutputFn | null>(null);
 	const workbookRef = useRef(workbook);
@@ -424,10 +452,10 @@ export function useToolDispatch(
 
 			// save_template / submit_submission: 按文件名把图片附件转成 { name, dataUrl } 注入
 			if (name === "save_template" && !input.sourceImages && Array.isArray(input.sourceImageNames)) {
-				input.sourceImages = pickImages(pendingFilesRef.current, input.sourceImageNames as string[]);
+				input.sourceImages = pickImages(pendingFilesRef.current, input.sourceImageNames as string[], imageIdsRef?.current);
 			}
 			if (name === "submit_submission" && !input.images && Array.isArray(input.imageNames)) {
-				input.images = pickImages(pendingFilesRef.current, input.imageNames as string[]);
+				input.images = pickImages(pendingFilesRef.current, input.imageNames as string[], imageIdsRef?.current);
 			}
 
 			// 只读工具缓存命中 → 直接返回
@@ -452,7 +480,7 @@ export function useToolDispatch(
 			}
 
 			const result: { success: boolean; data?: unknown; error?: string } =
-				await withTimeout(handler(wb!, input), TOOL_TIMEOUT_MS, name);
+				await withTimeout(handler(wb!, input), getToolTimeoutMs(name), name);
 			// handler 返回 success:false 时走 error 状态，让 UI 明确展示
 			if (!result.success) {
 				emitOutput({ state: "output-error", tool: name, toolCallId, errorText: result.error ?? "工具执行失败" }, name);

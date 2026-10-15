@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback, useEffect } from "react";
-import type { AppUIMessage } from "@/lib/agent/ui-message";
+import type { AppUIMessage, AgentPhase, ContextCompactedData, ReplyMetrics } from "@/lib/agent/ui-message";
 import {
 	type Session,
 	generateSessionId,
@@ -61,7 +61,7 @@ async function generateTitle(firstMessage: string): Promise<string> {
 interface UseSessionReturn {
 	session: Session;
 	/** 保存消息到当前会话（应在每次 messages 变化后调用） */
-	syncMessages: (messages: AppUIMessage[]) => void;
+	syncMessages: (messages: AppUIMessage[], isStreaming?: boolean) => void;
 	/** 立即刷新：取消防抖，将最新 messages 写入 DB（AI 回复结束时调用） */
 	flushMessages: () => void;
 	/** 切换到指定会话 */
@@ -77,7 +77,14 @@ interface UseSessionReturn {
 	/** Fork 会话：复制 messageId 之前的所有消息到新会话，返回新会话和被 fork 消息的文本 */
 	forkSession: (messageId: string, messages: AppUIMessage[]) => Promise<{ session: Session; inputText: string }>;
 	/** 保存本次 AI 回复的真实 token 用量到当前会话（不更新 updatedAt） */
-	saveTokenUsage: (usage: { promptTokens: number; contextWindow: number }) => void;
+	saveTokenUsage: (usage: { promptTokens: number; contextWindow: number; model?: string; contextWindowSource?: "env" | "model-map" | "default" }) => void;
+	/** 保存指定 assistant 回复的耗时（不更新 updatedAt） */
+	saveReplyDuration: (messageId: string, durationMs: number) => void;
+	/** 保存本次 AI 回复的运行指标（不更新 updatedAt） */
+	saveReplyMetrics: (messageId: string, metrics: ReplyMetrics) => void;
+	/** 保存服务端上下文自动压缩状态到当前会话（不更新 updatedAt） */
+	saveCompaction: (data: ContextCompactedData) => void;
+	saveWorkflowState: (state: { active: boolean; phase: AgentPhase; phaseStep: number; totalStep: number }) => void;
 }
 
 export function useSession(userId: string): UseSessionReturn {
@@ -100,11 +107,20 @@ export function useSession(userId: string): UseSessionReturn {
 	useEffect(() => () => { if (dbTimerRef.current) clearTimeout(dbTimerRef.current); }, []);
 
 	const syncMessages = useCallback(
-		(messages: AppUIMessage[]) => {
+		(messages: AppUIMessage[], isStreaming = false) => {
 			// 始终保存最新 messages 到 ref（零成本，不触发 render）
 			latestMessagesRef.current = messages;
 
-			// 防抖：2s 内只触发一次 setSession + DB 写入（流式传输期间的安全网）
+			// 流式期间只更新内存引用；完成时由 flushMessages 一次性持久化整段消息。
+			if (isStreaming) {
+				if (dbTimerRef.current) {
+					clearTimeout(dbTimerRef.current);
+					dbTimerRef.current = null;
+				}
+				return;
+			}
+
+			// 非流式消息变化仍使用防抖，避免会话切换/恢复时频繁写入。
 			if (dbTimerRef.current) clearTimeout(dbTimerRef.current);
 			const shouldSkipTimestamp = skipTimestampRef.current;
 			skipTimestampRef.current = false;
@@ -262,10 +278,52 @@ export function useSession(userId: string): UseSessionReturn {
 		return sessionRef.current.snapshotMap?.[messageId];
 	}, []);
 
-	const saveTokenUsage = useCallback((usage: { promptTokens: number; contextWindow: number }) => {
+	const saveTokenUsage = useCallback((usage: { promptTokens: number; contextWindow: number; model?: string; contextWindowSource?: "env" | "model-map" | "default" }) => {
 		setSession((prev) => {
 			// 仅更新 tokenUsage，保留 updatedAt 不变（避免无谓置顶）
 			const updated = { ...prev, tokenUsage: usage };
+			saveSession(updated).catch(() => {});
+			return updated;
+		});
+	}, []);
+
+	const saveReplyDuration = useCallback((messageId: string, durationMs: number) => {
+		setSession((prev) => {
+			const updated = {
+				...prev,
+				replyDurations: { ...prev.replyDurations, [messageId]: durationMs },
+				messages: latestMessagesRef.current,
+			};
+			saveSession(updated).catch(() => {});
+			return updated;
+		});
+	}, []);
+
+	const saveReplyMetrics = useCallback((messageId: string, metrics: ReplyMetrics) => {
+		setSession((prev) => {
+			const updated = {
+				...prev,
+				replyMetrics: { ...prev.replyMetrics, [messageId]: metrics },
+				messages: latestMessagesRef.current,
+			};
+			saveSession(updated).catch(() => {});
+			return updated;
+		});
+	}, []);
+
+	/** 保存服务端上下文压缩状态：下一次请求随 body 回传，实现增量摘要 */
+	const saveCompaction = useCallback((data: ContextCompactedData) => {
+		setSession((prev) => {
+			// 与 saveTokenUsage 一致：不更新 updatedAt，避免仅压缩就置顶会话
+			const updated = { ...prev, compaction: data };
+			saveSession(updated).catch(() => {});
+			return updated;
+		});
+	}, []);
+
+	const saveWorkflowState = useCallback((state: { active: boolean; phase: AgentPhase; phaseStep: number; totalStep: number }) => {
+		setSession((prev) => {
+			const updated = { ...prev, workflowState: state };
 			saveSession(updated).catch(() => {});
 			return updated;
 		});
@@ -319,5 +377,5 @@ export function useSession(userId: string): UseSessionReturn {
 	// 会话仅在收到第一条消息（syncMessages 调用）时才写入 DB，
 	// 避免每次刷新都产生一个空的"新会话"记录。
 
-	return { session, syncMessages, flushMessages, switchSession, newSession, onTitleChange, linkSnapshot, getSnapshotId, forkSession, saveTokenUsage };
+	return { session, syncMessages, flushMessages, switchSession, newSession, onTitleChange, linkSnapshot, getSnapshotId, forkSession, saveTokenUsage, saveReplyDuration, saveReplyMetrics, saveCompaction, saveWorkflowState };
 }

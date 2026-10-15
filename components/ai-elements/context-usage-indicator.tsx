@@ -107,6 +107,13 @@ export const ContextUsageIndicator = memo(function ContextUsageIndicator({
 							: <span className="ml-1 text-popover-foreground/30" title="仅客户端估算">○</span>
 						}
 					</div>
+					<div className="mt-1 space-y-0.5 text-[11px] text-popover-foreground/60">
+						{usage.isReal && usage.serverInputTokens != null && <div>服务端最后一步：{formatTokenCount(usage.serverInputTokens)}</div>}
+						<div>客户端历史估算：{formatTokenCount(usage.estimatedTokens ?? usage.used)}</div>
+						{usage.model && <div className="truncate" title={usage.model}>模型：{usage.model}</div>}
+						<div>窗口来源：{usage.contextWindowSource === "env" ? "环境变量" : usage.contextWindowSource === "model-map" ? "模型映射" : "默认估算"}</div>
+						{usage.isReal && usage.serverInputTokens != null && usage.serverInputTokens > total && <div className="text-destructive">模型上下文配置可能不匹配</div>}
+					</div>
 				</div>
 
 				{/* 系统 */}
