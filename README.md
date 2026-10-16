@@ -155,9 +155,25 @@ cp .env.example .env.local
 
 常用可选项：
 
-- `VISION_API_KEY` / `VISION_BASE_URL` / `VISION_MODEL`: 图片理解模型
+- `VISION_API_KEY` / `VISION_BASE_URL` / `VISION_MODEL`: 独立视觉模型（**兜底**）。主模型原生支持图片时（如 `deepseek-v4.1-flash` / `deepseek-flash` / `glm-5.3-flash`）图片链路直接走主模型，不额外挂载视觉模型，这三项可留空；确需强制走独立视觉模型时设 `VISION_FORCE=true`
+- `MODEL_CONTEXT_WINDOW`: 显式指定主模型真实上下文窗口，优先级高于内置模型表；用于内置表未覆盖的新模型
 - `TITLE_API_KEY` / `TITLE_BASE_URL` / `TITLE_MODEL`: 会话标题模型
 - `TAVILY_API_KEY`: 启用 Tavily 网络搜索，未配置时默认回退到 DuckDuckGo
+
+### 模型能力与上下文窗口
+
+上下文窗口按模型名匹配内置表（`lib/config.ts: CONTEXT_WINDOW_MAP`），命中即用，未命中回退 128K；`MODEL_CONTEXT_WINDOW` 可覆盖。用量条与自动压缩阈值都基于这个数值，配错会导致「100% 硬停」误报，因此新增模型时建议先核对官方文档。
+
+| 模型 | 上下文窗口 | 图片输入 |
+| --- | --- | --- |
+| `deepseek-v4.1-flash` / `deepseek-flash` | 1,000,000 | 原生支持 |
+| `deepseek-v4-pro` | 1,000,000 | 不支持 |
+| `glm-5.3-flash` / `glm-5.3-flashx` | 1,000,000 | 原生支持 |
+| `glm-5.3` / `glm-5.2` | 1,000,000 | 不支持 |
+| `glm-5` / `glm-5.1` / `glm-4.7` / `glm-4.6` | 200,000 | 不支持 |
+| `glm-4.5` 及更早 | 128,000 | 不支持 |
+
+以上数字来自 DeepSeek 与智谱官方文档（2026-10 核对）。`isVisionCapable`（`lib/llm/capabilities.ts`）只按模型名判断能力，命中「原生支持图片」时图片链路直接走主模型，不再切换到 `VISION_MODEL`；主模型不支持图片时才回退到独立视觉模型。
 
 业务数据可选项（单据模板化填报系统）：
 

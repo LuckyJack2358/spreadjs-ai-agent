@@ -14,6 +14,7 @@ import { getCurrentUser } from "@/lib/server/identity";
 import { getRepo } from "@/lib/server/repo";
 import { UsageTracker } from "@/lib/agent/usage-tracker";
 import { buildLLM, detectProvider } from "@/lib/llm/provider";
+import { shouldUseSeparateVisionModel } from "@/lib/llm/capabilities";
 import { buildProviderOptions } from "@/lib/llm/provider-options";
 import { LLM_CONFIG, VISION_LLM_CONFIG, getContextWindowInfo, getTaskMaxOutputTokens } from "@/lib/config";
 import { errorLogger } from "@/lib/logging";
@@ -42,9 +43,17 @@ const llm = buildLLM({
 	baseURL: LLM_CONFIG.baseURL,
 });
 
-const visionLlm = VISION_LLM_CONFIG.model
+/**
+ * 独立视觉模型（可选兜底）。主模型原生支持图片时不再单独挂 VISION_MODEL，
+ * 图片链路直接走主模型，避免多一跳转发与上下文窗口/用量被记到视觉模型名下。
+ */
+const visionModelName = shouldUseSeparateVisionModel(LLM_CONFIG.model, VISION_LLM_CONFIG.model)
+	? VISION_LLM_CONFIG.model
+	: undefined;
+
+const visionLlm = visionModelName
 	? buildLLM({
-		model: VISION_LLM_CONFIG.model,
+		model: visionModelName,
 		apiKey: process.env[VISION_LLM_CONFIG.apiKeyEnv] ?? process.env[LLM_CONFIG.apiKeyEnv],
 		baseURL: VISION_LLM_CONFIG.baseURL ?? LLM_CONFIG.baseURL,
 	})
@@ -115,7 +124,7 @@ function resolveRoleFromCookie(req: Request): UserRole | undefined {
  */
 function resolveModel(hasVisionImage: boolean) {
 	const useVision = visionLlm && hasVisionImage;
-	const activeModelName = useVision ? VISION_LLM_CONFIG.model! : LLM_CONFIG.model;
+	const activeModelName = useVision ? visionModelName! : LLM_CONFIG.model;
 	const activeBaseURL = useVision
 		? (VISION_LLM_CONFIG.baseURL ?? LLM_CONFIG.baseURL)
 		: LLM_CONFIG.baseURL;

@@ -15,7 +15,7 @@
  *   LLM_API_KEY / LLM_BASE_URL / LLM_MODEL
  *   LLM_PROVIDER=anthropic|deepseek|google|openai  — 强制覆盖 provider 检测
  *   LLM_REASONING=true|false                       — 强制关闭 thinking 归一化（仅 openai 路径）
- *   VISION_API_KEY / VISION_BASE_URL / VISION_MODEL
+ *   VISION_API_KEY / VISION_BASE_URL / VISION_MODEL  — 独立视觉模型（仅主模型不支持图片时启用）
  */
 
 import { extractReasoningMiddleware, wrapLanguageModel, type LanguageModelMiddleware } from "ai";

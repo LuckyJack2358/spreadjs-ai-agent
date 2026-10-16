@@ -54,12 +54,17 @@ const CONTEXT_WINDOW_MAP: Array<[RegExp, number]> = [
 	[/\bgpt-4-turbo\b/i, 128000],
 	[/\bgpt-4\b/i, 8192],
 	[/\bo[134]-/i, 200000],
-	// GLM（智谱）
-	[/\bglm-4\.7\b/i, 128000],
+	// GLM（智谱）—— 5.3 / 5.2 为 1M 窗口；5 / 5.1 / 4.7 / 4.6 为 200K；4.5 及以下 128K
+	[/\bglm-5\.3\b/i, 1000000],
+	[/\bglm-5\.2\b/i, 1000000],
+	[/\bglm-5\b/i, 200000],
+	[/\bglm-4\.7\b/i, 200000],
+	[/\bglm-4\.6\b/i, 200000],
 	[/\bglm-4\.5\b/i, 128000],
-	[/\bglm-5\b/i, 128000],
 	[/\bglm-4\b/i, 128000],
-	// DeepSeek
+	// DeepSeek —— V4.1-Flash（deepseek-flash）/ V4 系列为 1M 窗口
+	[/\bdeepseek-flash/i, 1000000],
+	[/\bdeepseek-v4/i, 1000000],
 	[/\bdeepseek-v3/i, 128000],
 	[/\bdeepseek-r1/i, 128000],
 	[/\bdeepseek-chat/i, 128000],

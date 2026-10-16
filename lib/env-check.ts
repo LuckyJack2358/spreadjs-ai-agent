@@ -17,8 +17,9 @@ export function checkEnv(): EnvCheckResult {
 	if (_cached) return _cached;
 
 	const missing = REQUIRED_ENV_VARS.filter((key) => !process.env[key]);
-	// VISION_MODEL 显式配置，或主模型本身支持多模态
-	const visionAvailable = !!process.env.VISION_MODEL || isVisionCapable(LLM_CONFIG.model);
+	// 主模型原生支持多模态时直接用主模型；否则需要显式配置 VISION_MODEL 兜底
+	const mainModelHasVision = isVisionCapable(LLM_CONFIG.model);
+	const visionAvailable = mainModelHasVision || !!process.env.VISION_MODEL;
 
 	if (missing.length > 0) {
 		console.warn(
@@ -27,6 +28,10 @@ export function checkEnv(): EnvCheckResult {
 	}
 	if (!visionAvailable) {
 		console.warn("[env-check] ⚠ 主模型不支持多模态且未配置 VISION_MODEL，图片附件功能不可用。");
+	} else if (mainModelHasVision && process.env.VISION_MODEL) {
+		console.info(
+			"[env-check] ℹ 主模型 " + LLM_CONFIG.model + " 原生支持图片，图片链路直接走主模型，已忽略 VISION_MODEL=" + process.env.VISION_MODEL + "（需强制走独立视觉模型请设 VISION_FORCE=true）。",
+		);
 	}
 
 	_cached = { available: missing.length === 0, missing, visionAvailable };
