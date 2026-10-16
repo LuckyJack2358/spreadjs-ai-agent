@@ -23,6 +23,56 @@ function resumeAll(workbook: SpreadWorkbook): void {
 	}
 }
 
+type ClearFn = (...args: unknown[]) => unknown;
+
+interface ClearPatch {
+	sheet: { clear?: ClearFn };
+	original: ClearFn;
+}
+
+/**
+ * 修补 `sheet.clear` 的「5 参数静默失效」陷阱。
+ *
+ * SpreadJS 的 `clear(row, col, rowCount, colCount, sheetArea?, storageType?)`
+ * 在 `storageType` 缺省时取值为 0（既不删数据也不删样式），调用后什么都不清。
+ * 这类调用不会报错，只会让上一轮写入的残余内容留在表上 —— AI 在
+ * execute_code 里写成 `sheet.clear(0, 0, 25, 10, GC.Spread.Sheets.SheetArea.viewport)`
+ * 时就会踩中。这里在沙箱执行期间临时包装该方法：缺参数或传 0 时补成
+ * data | style，并记录一条显式警告，绝不静默残留。
+ */
+function patchClear(sheet: unknown, logs: string[]): ClearPatch | null {
+	const target = sheet as { clear?: ClearFn } | null;
+	if (!target) return null;
+	const original = target.clear;
+	if (typeof original !== "function") return null;
+	const patched: ClearFn = function (this: unknown, ...args: unknown[]) {
+		const storageType = args.length >= 6 ? args[5] : undefined;
+		if (args.length < 6 || !storageType) {
+			const [row, col, rowCount, colCount, sheetArea] = args;
+			logs.push(
+				"[warn] sheet.clear 未指定 storageType（或传 0），原本不会清除任何内容；已自动补为 data|style。",
+			);
+			return original.call(
+				this,
+				row,
+				col,
+				rowCount,
+				colCount,
+				sheetArea ?? GC.Spread.Sheets.SheetArea.viewport,
+				GC.Spread.Sheets.StorageType.data | GC.Spread.Sheets.StorageType.style,
+			);
+		}
+		return original.apply(this, args);
+	};
+	target.clear = patched;
+	return { sheet: target as { clear?: ClearFn }, original };
+}
+
+function unpatchClear(patch: ClearPatch | null): void {
+	if (!patch) return;
+	patch.sheet.clear = patch.original;
+}
+
 /** 在临时隐藏 SpreadJS 实例上预执行代码，验证不会导致崩溃 */
 function preExecute(code: string, json: object): { ok: true } | { ok: false; error: string } {
 	let container: HTMLDivElement | null = null;
@@ -40,8 +90,13 @@ function preExecute(code: string, json: object): { ok: true } | { ok: false; err
 
 		const sheet = tempWorkbook.getActiveSheet();
 		const noop = () => {};
+		const patch = patchClear(sheet, []);
 		const fn = new Function("workbook", "sheet", "GC", "log", `"use strict";\n${code}`);
-		fn(tempWorkbook, sheet, GC, noop);
+		try {
+			fn(tempWorkbook, sheet, GC, noop);
+		} finally {
+			unpatchClear(patch);
+		}
 
 		// 完整性校验：确认 SpreadJS 实例未崩溃
 		tempWorkbook.getActiveSheet();
@@ -92,10 +147,12 @@ export function executeSandboxed(
 	sandboxEvent.emitPhase(executionId, "executing");
 	suspendAll(workbook);
 	const startTime = performance.now();
+	let patch: ClearPatch | null = null;
 
 	try {
 		const sheet = workbook.getActiveSheet();
 		const log = (...args: unknown[]) => logs.push(args.map(String).join(" "));
+		patch = patchClear(sheet, logs);
 
 		const fn = new Function("workbook", "sheet", "GC", "log", `"use strict";\n${code}`);
 		fn(workbook, sheet, GC, log);
@@ -115,6 +172,7 @@ export function executeSandboxed(
 		};
 	}
 	finally {
+		unpatchClear(patch);
 		resumeAll(workbook);
 	}
 

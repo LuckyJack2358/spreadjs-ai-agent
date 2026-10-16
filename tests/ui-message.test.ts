@@ -3,7 +3,9 @@ import {
 	hasStreamingParts,
 	isAgentTimeoutPart,
 	markStreamingPartsDone,
+	mergeReplyMetrics,
 	type AppUIMessagePart,
+	type ReplyMetrics,
 } from "@/lib/agent/ui-message";
 
 function textPart(text: string, state?: "streaming" | "done"): AppUIMessagePart {
@@ -88,5 +90,66 @@ describe("isAgentTimeoutPart", () => {
 
 	it("普通文本 part 不误判", () => {
 		expect(isAgentTimeoutPart(textPart("hello"))).toBe(false);
+	});
+});
+
+function metrics(overrides: Partial<ReplyMetrics> = {}): ReplyMetrics {
+	return {
+		totalDurationMs: 1000,
+		modelDurationMs: 800,
+		toolDurationMs: 200,
+		steps: 2,
+		retries: 0,
+		compacted: false,
+		model: "gpt-5.6-sol",
+		provider: "openai",
+		contextWindow: 400_000,
+		...overrides,
+	};
+}
+
+describe("mergeReplyMetrics（自动续跑时合并同一轮回复的多次请求指标）", () => {
+	it("prev 为空时直接采用 next", () => {
+		const next = metrics();
+		expect(mergeReplyMetrics(null, next)).toBe(next);
+	});
+
+	it("累加耗时 / 步数 / 重试，使「耗时」与「N 步」口径一致", () => {
+		const merged = mergeReplyMetrics(
+			metrics({ totalDurationMs: 1000, modelDurationMs: 700, toolDurationMs: 300, steps: 3, retries: 1 }),
+			metrics({ totalDurationMs: 500, modelDurationMs: 400, toolDurationMs: 100, steps: 2, retries: 2 }),
+		);
+		expect(merged.totalDurationMs).toBe(1500);
+		expect(merged.modelDurationMs).toBe(1100);
+		expect(merged.toolDurationMs).toBe(400);
+		expect(merged.steps).toBe(5);
+		expect(merged.retries).toBe(3);
+	});
+
+	it("model / provider / contextWindow / requestId 取最新请求", () => {
+		const merged = mergeReplyMetrics(
+			metrics({ requestId: "req-1", model: "old-model", contextWindow: 128_000 }),
+			metrics({ requestId: "req-2", model: "new-model", contextWindow: 400_000, contextWindowSource: "env" }),
+		);
+		expect(merged.requestId).toBe("req-2");
+		expect(merged.model).toBe("new-model");
+		expect(merged.contextWindow).toBe(400_000);
+		expect(merged.contextWindowSource).toBe("env");
+	});
+
+	it("compacted / timedOut 取或，visionImages 取最大值", () => {
+		const merged = mergeReplyMetrics(
+			metrics({ compacted: false, timedOut: false, visionImages: 1 }),
+			metrics({ compacted: true, timedOut: true, visionImages: 3 }),
+		);
+		expect(merged.compacted).toBe(true);
+		expect(merged.timedOut).toBe(true);
+		expect(merged.visionImages).toBe(3);
+	});
+
+	it("缺少 visionImages 时按 0 处理，不会出现 NaN", () => {
+		const merged = mergeReplyMetrics(metrics(), metrics({ totalDurationMs: 10 }));
+		expect(merged.visionImages).toBe(0);
+		expect(Number.isNaN(merged.totalDurationMs)).toBe(false);
 	});
 });

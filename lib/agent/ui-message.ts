@@ -150,6 +150,30 @@ export interface ReplyMetrics {
 	requestId?: string;
 	/** 服务端硬超时中断了本轮请求 */
 	timedOut?: boolean;
+	/** 本轮请求中真实内联（还原为图片）的图片数量，用于诊断图片降级是否生效 */
+	visionImages?: number;
+}
+
+/**
+ * 合并同一轮 assistant 回复中多次请求的指标。
+ *
+ * 自动续跑（阶段边界 / 超时续跑）会把「一条回复」拆成多个 HTTP 请求，每个请求
+ * 各下发一次 data-reply-metrics。若只保留最后一次，界面上的「耗时」（按墙钟统计
+ * 整轮）与「N 步 · 模型 X · 工具 Y」会对不上。这里按累加口径合并，使两者一致。
+ */
+export function mergeReplyMetrics(prev: ReplyMetrics | null, next: ReplyMetrics): ReplyMetrics {
+	if (!prev) return next;
+	return {
+		...next, // model / provider / contextWindow / requestId 等取最新请求
+		totalDurationMs: prev.totalDurationMs + next.totalDurationMs,
+		modelDurationMs: prev.modelDurationMs + next.modelDurationMs,
+		toolDurationMs: prev.toolDurationMs + next.toolDurationMs,
+		steps: prev.steps + next.steps,
+		retries: prev.retries + next.retries,
+		compacted: prev.compacted || next.compacted,
+		timedOut: !!(prev.timedOut || next.timedOut),
+		visionImages: Math.max(prev.visionImages ?? 0, next.visionImages ?? 0),
+	};
 }
 
 type AppToolName = BuiltinToolName | "take_screenshot";

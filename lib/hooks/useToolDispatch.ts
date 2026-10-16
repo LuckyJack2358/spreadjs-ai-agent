@@ -10,9 +10,10 @@ import { createToolCache, type ToolCache } from "@/lib/hooks/useToolCache";
 import { resolveAddress, parseRangeAddress } from "@/lib/spreadjs/utils";
 import { loadBridge } from "@/lib/tools/types";
 import type { ConfirmRequest } from "@/lib/hooks/useDestructiveGuard";
-import { setFormContext } from "@/lib/agent/form-context";
+import { getFormContext, setFormContext } from "@/lib/agent/form-context";
 import { pickNamedImages } from "@/lib/agent/image-ref";
 import type { LoadTemplateOutput } from "@/lib/tools/defs/form/load-template";
+import type { SaveTemplateOutput } from "@/lib/tools/defs/form/save-template";
 import type { TemplateField } from "@/lib/server/types";
 
 /**
@@ -518,6 +519,24 @@ export function useToolDispatch(
 				}
 			}
 
+			// save_template 成功后把模板标记为「画布当前模板」，
+			// 管理抽屉据此显示「保存为新版本」，让管理员可以在 AI 生成后继续微调并覆盖保存
+			if (name === "save_template") {
+				const st = result.data as SaveTemplateOutput | undefined;
+				if (st?.templateId) {
+					const existing = getFormContext();
+					// 优先用服务端落库后的字段地图（已补齐 valueType 并完成清理），
+					// 只有服务端没返回时才回落到画布上原有的字段
+					const fields = (st.fields?.length ? st.fields : existing?.fields ?? []) as TemplateField[];
+					setFormContext({
+						assignmentId: null,
+						templateId: st.templateId,
+						templateName: st.name,
+						fields,
+						sourceImages: st.sourceImages ?? [],
+					});
+				}
+			}
 			// 非只读、非 Agent 工具（即写入类工具）执行后清空缓存
 			if (!cache.isReadOnly(name) && !AGENT_TOOLS.has(name)) {
 				cache.invalidate();

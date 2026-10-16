@@ -1,5 +1,5 @@
 import { z } from "zod/v4";
-import type { ToolDef } from "../../types";
+import { loadBridge, type ToolDef } from "../../types";
 import type { NamedImageSource } from "@/lib/agent/image-ref";
 import { apiFetch, describeApiError } from "./api";
 
@@ -88,11 +88,29 @@ const inputSchema = z.object({
 	description: z.string().optional().describe("模板说明"),
 	fields: z.array(templateFieldSchema).min(1).describe("字段地图：字段名 → 目标单元格地址"),
 	sourceImageNames: z.array(z.string()).optional().describe("作为模板原图的图片文件名（来自消息中的 [图片: xxx] 标记）"),
+	autoFitLayout: z
+		.boolean()
+		.optional()
+		.default(true)
+		.describe("保存前自动适配行高列宽（合并区感知）。默认 true；仅当用户明确要求保留手工设定的尺寸时传 false"),
 });
 
 export type SaveTemplateInput = z.infer<typeof inputSchema> & {
 	sourceImages?: NamedImageSource[];
 };
+
+/** 保存模板时自动清理的残余内容统计 */
+export interface TemplateCleanupReport {
+	/** 是否发生了清理 */
+	changed: boolean;
+	/** 合并区内重复写入、被清掉的单元格数 */
+	clearedSpanCopies: number;
+	/** 相邻重复标签被合并的数量 */
+	collapsedDuplicateLabels: number;
+	/** 被标签占位、已清空的字段值位数量 */
+	clearedFieldPlaceholders: number;
+	notes: string[];
+}
 
 export interface SaveTemplateOutput {
 	templateId: string;
@@ -101,6 +119,17 @@ export interface SaveTemplateOutput {
 	fieldCount: number;
 	overwritten: boolean;
 	sourceImages: UploadedImageRef[];
+	/** 落库时使用的字段地图（含系统补齐的 valueType） */
+	fields: Array<{ name: string; address: string; sheetName?: string; valueType?: string }>;
+	/** 保存时自动清理的残余内容统计 */
+	cleanup?: TemplateCleanupReport;
+	/** 保存前自动适配行高列宽的结果 */
+	layout?: Array<{
+		sheetName: string;
+		fittedColumns: number;
+		fittedRows: number;
+		blockCount: number;
+	}>;
 }
 
 const saveTemplate: ToolDef<SaveTemplateInput, SaveTemplateOutput> = {
@@ -115,12 +144,39 @@ const saveTemplate: ToolDef<SaveTemplateInput, SaveTemplateOutput> = {
 	handler: async (workbook, input) => {
 		if (!workbook) return { success: false, error: "SpreadJS 尚未初始化" };
 		try {
+			// 保存前先做一次合并区感知的整版自适应：
+			// SpreadJS 原生 autoFitColumn 对跨列合并的表头（如 D:F）不敏感，
+			// AI 也经常忘记调用 —— 这里兜底，保证落库的模板行高列宽一定可读。
+			let layout: NonNullable<SaveTemplateOutput["layout"]> | undefined;
+			if (input.autoFitLayout !== false) {
+				try {
+					const bridge = await loadBridge();
+					const fitted = bridge.autoFitWorkbook(workbook, true);
+					if (fitted.success && fitted.data) {
+						layout = fitted.data.sheets.map((s) => ({
+							sheetName: s.sheetName,
+							fittedColumns: s.fittedColumns,
+							fittedRows: s.fittedRows,
+							blockCount: s.blockCount,
+						}));
+					}
+				} catch (e) {
+					// 自适应失败不阻断保存（模板照样落库，用户还能手工调）
+					console.error("[save_template] autoFitWorkbook failed", e);
+				}
+			}
 			const snapshot = workbook.toJSON() as Record<string, unknown>;
 			const existing = await fetchTemplates();
 			const overwritten = existing.some((t) => t.name.trim() === input.name.trim());
 			const sourceImages = await uploadNamedImages(input.sourceImageNames, input.sourceImages);
-			const { template } = await apiFetch<{
-				template: { id: string; name: string; version: number; fields: unknown[] };
+			const { template, cleanup } = await apiFetch<{
+				template: {
+					id: string;
+					name: string;
+					version: number;
+					fields: Array<{ name: string; address: string; sheetName?: string; valueType?: string }>;
+				};
+				cleanup?: TemplateCleanupReport;
 			}>("/api/templates", {
 				method: "POST",
 				body: JSON.stringify({
@@ -140,6 +196,9 @@ const saveTemplate: ToolDef<SaveTemplateInput, SaveTemplateOutput> = {
 					fieldCount: template.fields.length,
 					overwritten,
 					sourceImages,
+					fields: template.fields,
+					cleanup,
+					layout,
 				},
 			};
 		} catch (e) {

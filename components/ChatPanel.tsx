@@ -23,6 +23,7 @@ import {
 	isAgentProgressPart,
 	isAgentTimeoutPart,
 	isReplyMetricsPart,
+	mergeReplyMetrics,
 	isRetryStatusPart,
 	isTaskToolPart,
 	hasStreamingParts,
@@ -572,8 +573,9 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 			if (!part.data.canContinue) workflowActiveRef.current = false;
 		}
 		if (isReplyMetricsPart(part)) {
-			replyMetricsRef.current = part.data;
-			setReplyMetrics(part.data);
+			// 一轮回复可能由多个请求组成（自动续跑），指标按累加口径合并
+			replyMetricsRef.current = mergeReplyMetrics(replyMetricsRef.current, part.data);
+			setReplyMetrics(replyMetricsRef.current);
 			currentRequestIdRef.current = part.data.requestId ?? currentRequestIdRef.current;
 			setCurrentRequestId(currentRequestIdRef.current);
 		}
@@ -681,6 +683,9 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				replyStartRef.current = started;
 				setReplyStartedAt(started);
 				replyFinalizedMessageRef.current = null;
+				// 新一轮回复：清空上一轮累计的指标，避免跨轮次串味
+				replyMetricsRef.current = null;
+				setReplyMetrics(null);
 			}
 			prevReplyGeneratingRef.current = true;
 			return;
@@ -700,8 +705,8 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				const durationMs = Math.max(0, Date.now() - startedAt);
 				replyFinalizedMessageRef.current = assistant.id;
 				flushMessages();
-					saveReplyDuration(assistant.id, durationMs);
-					if (replyMetricsRef.current) saveReplyMetrics(assistant.id, replyMetricsRef.current);
+				saveReplyDuration(assistant.id, durationMs);
+				if (replyMetricsRef.current) saveReplyMetrics(assistant.id, replyMetricsRef.current);
 			}
 			replyStartRef.current = null;
 			setReplyStartedAt(null);

@@ -5,7 +5,7 @@ const itemSchema = z.object({
 	field: z.string().describe("字段名（模板字段地图中的名称）"),
 	address: z.string().describe('目标单元格地址，如 "B3" 或 "Sheet1!B3"'),
 	value: z.string().describe("从单据上识别出的值（保持原文本，不要换算或改写）"),
-	confidence: z.number().min(0).max(1).optional().describe("识别置信度 0~1，低于 0.7 视为待核对"),
+	confidence: z.coerce.number().min(0).max(1).optional().describe("识别置信度 0~1，低于 0.7 视为待核对"),
 	note: z.string().optional().describe("识别说明，如「字迹模糊」「与模板字段不符」"),
 });
 

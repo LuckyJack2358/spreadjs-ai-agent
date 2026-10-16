@@ -21,9 +21,40 @@ describe("form 工具注册", () => {
 		}
 	});
 
+	it("save_template 默认保存前自动适配版式（autoFitLayout 默认 true）", () => {
+		const schema = toolDefinitions.save_template.inputSchema;
+		const parsed = schema.parse({ name: "差旅报销单", fields: [{ name: "报销人", address: "B3" }] }) as {
+			autoFitLayout?: boolean;
+		};
+		expect(parsed.autoFitLayout).toBe(true);
+		const off = schema.parse({
+			name: "差旅报销单",
+			fields: [{ name: "报销人", address: "B3" }],
+			autoFitLayout: false,
+		}) as { autoFitLayout?: boolean };
+		expect(off.autoFitLayout).toBe(false);
+	});
+
 	it("每个 base 工具名都能在注册表中解析", () => {
 		const missing = baseToolNames.filter((n) => !(n in toolDefinitions));
 		expect(missing).toEqual([]);
+	});
+
+	it("propose_fill_data 容忍模型把 confidence 写成字符串（\"0.7\"）", () => {
+		const schema = toolDefinitions.propose_fill_data.inputSchema;
+		const parsed = schema.parse({
+			assignmentId: "asg_1",
+			items: [{ field: "报销人", address: "B3", value: "张三", confidence: "0.7" }],
+		}) as { items: { confidence?: number }[] };
+		expect(parsed.items[0].confidence).toBe(0.7);
+
+		// 省略 / 非法值都不能抛错
+		expect(() =>
+			schema.parse({ assignmentId: "asg_1", items: [{ field: "报销人", address: "B3", value: "张三" }] }),
+		).not.toThrow();
+		expect(() =>
+			schema.parse({ assignmentId: "asg_1", items: [{ field: "报销人", address: "B3", value: "张三", confidence: 1 }] }),
+		).not.toThrow();
 	});
 
 	it("按角色过滤后：员工可见 4 个填报工具，管理员额外可见 5 个管理工具", () => {

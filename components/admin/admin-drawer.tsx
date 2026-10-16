@@ -12,13 +12,17 @@ import {
 	LayoutTemplateIcon,
 	LoaderIcon,
 	RefreshCwIcon,
+	RulerIcon,
+	SaveIcon,
 	SendIcon,
 	Trash2Icon,
 	Undo2Icon,
 	UploadIcon,
 } from "lucide-react";
+import { loadBridge } from "@/lib/tools/types";
 import { useSpreadJS } from "@/lib/spreadjs/context";
-import { setFormContext, subscribeFormData } from "@/lib/agent/form-context";
+import { normalizeTemplateSnapshot } from "@/lib/spreadjs/normalize-template-snapshot";
+import { getFormContext, setFormContext, subscribeFormData, useFormContext } from "@/lib/agent/form-context";
 import type { AssignmentView, SubmissionView, TemplateRecord } from "@/lib/server/types";
 import { DrawerShell } from "@/components/admin/drawer-shell";
 import { describeError, formatTime, getJson, postJson } from "@/components/admin/admin-api";
@@ -52,6 +56,9 @@ interface AdminDrawerProps {
 
 export function AdminDrawer({ open, onClose }: AdminDrawerProps) {
 	const { workbook } = useSpreadJS();
+	// 画布当前挂着的模板（AI 保存模板 / 点「载入画布」时写入），用于判断能否「保存为新版本」
+	const formCtx = useFormContext();
+	const activeTemplateId = formCtx?.templateId ?? null;
 	const [tab, setTab] = useState<TabKey>("templates");
 	const [templates, setTemplates] = useState<TemplateRecord[]>([]);
 	const [assignments, setAssignments] = useState<AssignmentView[]>([]);
@@ -94,9 +101,14 @@ export function AdminDrawer({ open, onClose }: AdminDrawerProps) {
 				return;
 			}
 			try {
+				// 兜底清理：早期保存的模板可能带「合并区重复值 / 相邻重复标签 / 值位被标签占位」
+				const cleanup = normalizeTemplateSnapshot(
+					JSON.parse(JSON.stringify(template.snapshot)) as Record<string, unknown>,
+					template.fields,
+				);
 				workbook.suspendPaint();
 				try {
-					workbook.fromJSON(template.snapshot);
+					workbook.fromJSON(cleanup.snapshot);
 				} finally {
 					workbook.resumePaint();
 				}
@@ -107,7 +119,11 @@ export function AdminDrawer({ open, onClose }: AdminDrawerProps) {
 					fields: template.fields,
 					sourceImages: template.sourceImages ?? [],
 				});
-				setNotice(`已把模板「${template.name}」载入画布`);
+				setNotice(
+					cleanup.changed
+						? `已把模板「${template.name}」载入画布（顺带清理了残余内容：${cleanup.notes.join("；")}）`
+						: `已把模板「${template.name}」载入画布`,
+				);
 				setError(null);
 			} catch (e) {
 				setError(describeError(e));
@@ -129,6 +145,73 @@ export function AdminDrawer({ open, onClose }: AdminDrawerProps) {
 			}
 		},
 		[reload],
+	);
+
+	/** 一键按内容适配行高列宽（合并区感知） */
+	const handleAutoFit = useCallback(async () => {
+		if (!workbook) {
+			setError("SpreadJS 尚未初始化");
+			return;
+		}
+		try {
+			const bridge = await loadBridge();
+			const res = bridge.autoFitWorkbook(workbook, true);
+			if (!res.success || !res.data) throw new Error(res.error ?? "自适应失败");
+			const { fittedColumns, fittedRows } = res.data.sheets.reduce(
+				(acc, s) => ({ fittedColumns: acc.fittedColumns + s.fittedColumns, fittedRows: acc.fittedRows + s.fittedRows }),
+				{ fittedColumns: 0, fittedRows: 0 },
+			);
+			setError(null);
+			setNotice(`已按内容适配版式：${fittedColumns} 列 / ${fittedRows} 行`);
+		} catch (e) {
+			setError(describeError(e));
+		}
+	}, [workbook]);
+
+	/** 管理员微调画布后，把当前画布另存为该模板的新版本（同名覆盖 → version + 1） */
+	const handleSaveNewVersion = useCallback(
+		async (template: TemplateRecord) => {
+			if (!workbook) {
+				setError("SpreadJS 尚未初始化");
+				return;
+			}
+			// 防呆：画布上必须是这个模板，否则会把 A 的表型存进 B
+			if (getFormContext()?.templateId !== template.id) {
+				setError(`画布上当前不是「${template.name}」，请先点「载入画布」再保存新版本`);
+				return;
+			}
+			setError(null);
+			try {
+				const snapshot = workbook.toJSON() as Record<string, unknown>;
+				const ctx = getFormContext();
+				const fields = ctx?.fields?.length ? ctx.fields : template.fields;
+				const res = await postJson<{ template: TemplateRecord; cleanup?: { changed: boolean; notes: string[] } }>(
+					"/api/templates",
+					{
+						name: template.name,
+						description: template.description,
+						snapshot,
+						fields,
+						// 必须沿用原图，否则 UPDATE 会把模板原图清空
+						sourceImages: template.sourceImages ?? [],
+					},
+				);
+				// 回写 context：服务端会补齐 valueType、清理残余内容后的字段地图
+				setFormContext({
+					assignmentId: null,
+					templateId: res.template.id,
+					templateName: res.template.name,
+					fields: res.template.fields,
+					sourceImages: res.template.sourceImages ?? [],
+				});
+				const cleaned = res.cleanup?.changed ? "，并自动清理了残余内容" : "";
+				setNotice(`已把「${res.template.name}」保存为 v${res.template.version}（字段 ${res.template.fields.length} 个）${cleaned}`);
+				await reload();
+			} catch (e) {
+				setError(describeError(e));
+			}
+		},
+		[workbook, reload],
 	);
 
 	const handleRevoke = useCallback(
@@ -214,8 +297,11 @@ export function AdminDrawer({ open, onClose }: AdminDrawerProps) {
 						{tab === "templates" && (
 							<TemplateList
 								templates={templates}
+								activeTemplateId={activeTemplateId}
 								onLoad={handleLoadTemplate}
 								onDelete={handleDeleteTemplate}
+								onSaveNewVersion={handleSaveNewVersion}
+								onAutoFit={handleAutoFit}
 							/>
 						)}
 						{tab === "assignments" && (
@@ -244,12 +330,18 @@ export function AdminDrawer({ open, onClose }: AdminDrawerProps) {
 
 function TemplateList({
 	templates,
+	activeTemplateId,
 	onLoad,
 	onDelete,
+	onSaveNewVersion,
+	onAutoFit,
 }: {
 	templates: TemplateRecord[];
+	activeTemplateId: string | null;
 	onLoad: (t: TemplateRecord) => void;
 	onDelete: (t: TemplateRecord) => void;
+	onSaveNewVersion: (t: TemplateRecord) => void;
+	onAutoFit: () => void;
 }) {
 	if (templates.length === 0) {
 		return (
@@ -316,6 +408,32 @@ function TemplateList({
 							<UploadIcon className="size-3" />
 							载入画布
 						</Button>
+						{/* 微调画布后另存为新版本：仅当该模板正挂在画布上时可点，避免串模板 */}
+						<Button
+							size="xs"
+							variant="outline"
+							disabled={activeTemplateId !== t.id}
+							title={
+								activeTemplateId === t.id
+									? "把画布上当前内容保存为该模板的新版本"
+									: "请先点「载入画布」，再在画布上微调后保存新版本"
+							}
+							onClick={() => onSaveNewVersion(t)}
+						>
+							<SaveIcon className="size-3" />
+							保存新版本
+						</Button>
+						{activeTemplateId === t.id && (
+							<Button
+								size="xs"
+								variant="ghost"
+								title="按内容重新适配行高列宽（合并区感知）"
+								onClick={() => onAutoFit()}
+							>
+								<RulerIcon className="size-3" />
+								适配行列
+							</Button>
+						)}
 						<Button
 							size="xs"
 							variant="ghost"

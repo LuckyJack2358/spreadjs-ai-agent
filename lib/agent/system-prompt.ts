@@ -249,6 +249,17 @@ const businessRole: SectionBuilder = (ctx) => {
 2. 用 assign_template 按模板名 + 用户姓名分派；姓名模糊匹配失败或出现多个候选时，工具会返回候选列表，用 ask_user 让用户澄清，绝不臆测
 3. list_assignments 查看分派记录与状态（pending / submitted / revoked）
 
+版式硬性规范（生成模板时必须遵守）：
+- 标签与值位必须分列：标签只写在标签列，值位必须是空单元格；绝不要在两列写同一段文字
+  （错误示范：A2="单位" 且 B2="单位"；正确：A2="单位" 而 B2 留空）
+- 需要横跨多列的区域必须用 addSpan / merge_cells 真正合并，同一段文字只写在合并区左上角，
+  不要在被合并覆盖的单元格里重复写入
+- 字段地图的 address 必须指向「值位」（空单元格），不要指向标签单元格
+- 清空区域必须用 clear_cells 工具；在 execute_code 里用 sheet.clear 时必须传第 6 个参数
+  storageType（GC.Spread.Sheets.StorageType.data | style），省略参数不会清掉任何内容且不报错
+- 版式写完后调用 auto_fit_columns（columns 可省略 = 全部已用列，autoFitRows 传 true）调整行高列宽；
+  该工具按合并区感知计算，跨列标签所在的列不会再被挤窄
+- 保存前用 read_ranges 回读校验：值位必须是空的，重复文字必须已清理
 约束：
 - 分派前先用 list_users 确认用户姓名
 - 用户表达含糊时用 ask_user 澄清，不要擅自选择模板或用户`;
@@ -286,9 +297,9 @@ const formWorkflowSection: SectionBuilder = (ctx) => {
 	if (ctx.role !== "admin" || !ctx.workflowPhase) return "";
 	const instructions: Record<NonNullable<SystemPromptContext["workflowPhase"]>, string> = {
 		inspect: "识别空白单据图片的版式、字段名称和候选单元格位置。当前阶段只做读取和分析，不要写入工作簿，也不要保存模板。",
-		build: "根据已识别的字段和版式创建模板。使用工作簿写入、合并和格式工具完成布局；不要调用 save_template。",
-		verify: "读取关键区域核对字段地址、合并区域和布局。发现问题时回到写入工具修正；不要调用 save_template。",
-		finalize: "确认模板结构无误后调用一次 save_template 保存模板和字段地图。保存成功后停止，不要重复覆盖保存。",
+		build: "根据已识别的字段和版式创建模板。使用工作簿写入、合并和格式工具完成布局：标签与值位分列、值位留空、跨列区域真正合并。版式写完后调用 auto_fit_columns（autoFitRows: true）调整行高列宽。不要调用 save_template。",
+		verify: "读取关键区域核对：每个字段 address 指向的值位必须为空、同一行没有相邻重复文字、合并区域正确、行高列宽能完整显示内容。发现问题时回到写入工具修正；不要调用 save_template。",
+		finalize: "确认模板结构无误后调用一次 save_template 保存模板和字段地图。保存成功后停止，不要重复覆盖保存。保存前若尚未执行过 auto_fit_columns，先执行一次（autoFitRows: true）。",
 	};
 	const shared = [
 		"本次任务的源图（管理员上传的空白单据）已经在对话历史里，你可以直接查看；",

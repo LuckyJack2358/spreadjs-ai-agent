@@ -18,7 +18,7 @@ export { deleteWorksheet } from "./sheet/delete-worksheet";
 export { insertRowsCols } from "./sheet/insert-rows-cols";
 export { deleteRowsCols } from "./sheet/delete-rows-cols";
 export { resizeRange } from "./sheet/resize-range";
-export { autoFitColumns } from "./sheet/auto-fit-columns";
+export { autoFitColumns, autoFitWorkbook } from "./sheet/auto-fit-columns";
 export { freezePanes } from "./sheet/freeze-panes";
 export { changeActiveSheet } from "./sheet/change-active-sheet";
 export { copySheet } from "./sheet/copy-sheet";
