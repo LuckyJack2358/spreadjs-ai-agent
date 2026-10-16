@@ -32,6 +32,20 @@ describe("uploadNamedImages", () => {
 		expect(calls).toEqual([]);
 	});
 
+	it("只剩 imageId（刷新后靠历史消息兜底）时同样直接复用，不再上传", async () => {
+		const calls = stubFetch();
+		const refs = await uploadNamedImages(["blank.jpg"], [{ name: "blank.jpg", imageId: "img_hist" }]);
+		expect(refs).toEqual([{ id: "img_hist", name: "blank.jpg" }]);
+		expect(calls).toEqual([]);
+	});
+
+	it("文件名带空格也能命中已落盘的图片", async () => {
+		const calls = stubFetch();
+		const refs = await uploadNamedImages([" blank.jpg "], [{ name: "blank.jpg", imageId: "img_hist" }]);
+		expect(refs).toEqual([{ id: "img_hist", name: "blank.jpg" }]);
+		expect(calls).toEqual([]);
+	});
+
 	it("未落盘（上传失败回落）时仍走 POST /api/uploads", async () => {
 		const calls = stubFetch();
 		const refs = await uploadNamedImages(["a.jpg"], [{ name: "a.jpg", dataUrl: DATA_URL }]);

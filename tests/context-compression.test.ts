@@ -6,6 +6,8 @@ import {
 	estimateMessageTokens,
 	maybeCompactMessages,
 	normalizeCompactionCarry,
+	normalizeModelToolOutputs,
+	normalizeToolResultOutput,
 	pruneModelToolResults,
 	type Summarizer,
 } from "@/lib/agent/context-compression";
@@ -328,21 +330,68 @@ describe("pruneModelToolResults", () => {
 		} as never;
 
 		const result = pruneModelToolResults([early, { role: "user", content: "q" } as never, recent], 1);
-		const oldPart = result[0].content[0] as { toolCallId: string; output: Record<string, unknown> };
+		const oldPart = result[0].content[0] as { toolCallId: string; output: { type: string; value: Record<string, unknown> } };
 		const newPart = result[2].content[0] as unknown as { output: string };
 		expect(oldPart.toolCallId).toBe("old-1");
-		expect(oldPart.output.truncated).toBe(true);
+		expect(oldPart.output.type).toBe("json");
+		expect(oldPart.output.value.truncated).toBe(true);
 		expect(newPart.output).toBe(large);
+	});
+
+	it("裁剪后的 output 必须是合法 ToolResultOutput（否则上游会丢掉整个 content 字段）", () => {
+		const validTypes = new Set(["text", "json", "content", "error-text", "error-json", "execution-denied"]);
+		const toolMsg = {
+			role: "tool",
+			content: [
+				{ type: "tool-result", toolCallId: "a", toolName: "read_ranges", output: large },
+				{ type: "tool-result", toolCallId: "b", toolName: "search_data", output: { type: "json", value: { text: large } } },
+				{ type: "tool-result", toolCallId: "c", toolName: "mcp__x__search", output: { type: "text", value: large } },
+			],
+		} as never;
+
+		const result = pruneModelToolResults([toolMsg, { role: "user", content: "q" } as never], 0);
+		for (const part of result[0].content as Array<{ output: { type?: unknown } }>) {
+			expect(validTypes.has(String(part.output?.type))).toBe(true);
+		}
+	});
+
+	it("遗留的无 type output 被归一化（而不是丢给上游）", () => {
+		// 旧版本代码产物：无 type 的裁剪对象
+		const legacy = {
+			role: "tool",
+			content: [{ type: "tool-result", toolCallId: "legacy-1", toolName: "read_ranges", output: { truncated: true, preview: "p" } }],
+		} as never;
+
+		const pruned = pruneModelToolResults([legacy, { role: "user", content: "q" } as never], 0);
+		const parts = pruned[0].content as Array<{ output: { type: string; value: unknown } }>;
+		expect(parts[0].output.type).toBe("json");
+		expect(parts[0].output.value).toEqual({ truncated: true, preview: "p" });
+
+		const normalized = normalizeModelToolOutputs([legacy]);
+		expect(normalized[0]).not.toBe(legacy);
+
+		expect(normalizeToolResultOutput("plain text")).toEqual({ type: "json", value: "plain text" });
+		expect(normalizeToolResultOutput(undefined)).toEqual({ type: "json", value: null });
+		expect(normalizeToolResultOutput({ type: "text", value: "ok" })).toEqual({ type: "text", value: "ok" });
+	});
+
+	it("合法输出不被改动（归一化只修形状）", () => {
+		const ok = {
+			role: "tool",
+			content: [{ type: "tool-result", toolCallId: "ok-1", toolName: "read_ranges", output: { type: "text", value: "hi" } }],
+		} as never;
+		const messages = [ok];
+		expect(normalizeModelToolOutputs(messages)).toBe(messages);
 	});
 
 	it("关键业务工具、小结果和无改动输入保持不变", () => {
 		const important = {
 			role: "tool",
-			content: [{ type: "tool-result", toolCallId: "save-1", toolName: "save_template", output: large }],
+			content: [{ type: "tool-result", toolCallId: "save-1", toolName: "save_template", output: { type: "text", value: large } }],
 		} as never;
 		const small = {
 			role: "tool",
-			content: [{ type: "tool-result", toolCallId: "small-1", toolName: "read_ranges", output: "small" }],
+			content: [{ type: "tool-result", toolCallId: "small-1", toolName: "read_ranges", output: { type: "text", value: "small" } }],
 		} as never;
 		const messages = [important, small];
 		const result = pruneModelToolResults(messages, 0);

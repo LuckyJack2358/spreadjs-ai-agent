@@ -34,6 +34,22 @@ export interface AgentProgressData {
 }
 
 /**
+ * 服务端硬超时（AGENT_REQUEST_TIMEOUT_MS）通知。
+ * 上游被 abort 时只会下发 abort chunk、不会补发 reasoning-end，
+ * 前端据此收尾悬空的「思考中」状态，并决定是否自动续跑。
+ */
+export interface AgentTimeoutData {
+	runId: string;
+	requestId: string;
+	phase: AgentPhase;
+	elapsedMs: number;
+	timeoutMs: number;
+	steps: number;
+	toolCalls: boolean;
+	canContinue: boolean;
+}
+
+/**
  * 服务端上下文自动压缩通知。
  * 由 `/api/chat` 在压缩生效时以 data part 下发，前端持久化到会话，
  * 并在下一次请求时回传 summary + watermark 做增量摘要。
@@ -116,6 +132,7 @@ export type AppDataParts = Record<string, unknown> & {
 	"context-compacted": ContextCompactedData;
 	"agent-progress": AgentProgressData;
 	"reply-metrics": ReplyMetrics;
+	"agent-timeout": AgentTimeoutData;
 };
 
 export interface ReplyMetrics {
@@ -131,6 +148,8 @@ export interface ReplyMetrics {
 	contextWindowSource?: "env" | "model-map" | "default";
 	runId?: string;
 	requestId?: string;
+	/** 服务端硬超时中断了本轮请求 */
+	timedOut?: boolean;
 }
 
 type AppToolName = BuiltinToolName | "take_screenshot";
@@ -186,6 +205,12 @@ export type AgentProgressPart = {
 	data: AgentProgressData;
 };
 
+export type AgentTimeoutPart = {
+	type: "data-agent-timeout";
+	id?: string;
+	data: AgentTimeoutData;
+};
+
 export type ReplyMetricsPart = {
 	type: "data-reply-metrics";
 	id?: string;
@@ -225,6 +250,30 @@ export function isAgentProgressPart(part: AppUIMessagePart): part is AgentProgre
 
 export function isReplyMetricsPart(part: AppUIMessagePart): part is ReplyMetricsPart {
 	return isDataUIPart(part) && part.type === "data-reply-metrics";
+}
+
+export function isAgentTimeoutPart(part: AppUIMessagePart): part is AgentTimeoutPart {
+	return isDataUIPart(part) && part.type === "data-agent-timeout";
+}
+
+/**
+ * 把仍处于 streaming 的文本/推理 part 强制置为 done。
+ * 上游 abort（服务端超时 / 用户中断）不会补发 reasoning-end，
+ * 不回收就让「思考中…」永久转下去，输入框与标题栏也无法回到就绪。
+ */
+export function hasStreamingParts(parts: AppUIMessagePart[]): boolean {
+	return parts.some((part) => (part.type === "text" || part.type === "reasoning") && part.state === "streaming");
+}
+
+export function markStreamingPartsDone(parts: AppUIMessagePart[]): { parts: AppUIMessagePart[]; changed: boolean } {
+	let changed = false;
+	const next = parts.map((part) => {
+		if (part.type !== "text" && part.type !== "reasoning") return part;
+		if (part.state !== "streaming") return part;
+		changed = true;
+		return { ...part, state: "done" as const } as AppUIMessagePart;
+	});
+	return changed ? { parts: next, changed } : { parts, changed };
 }
 
 export type ContextCompactedPart = {

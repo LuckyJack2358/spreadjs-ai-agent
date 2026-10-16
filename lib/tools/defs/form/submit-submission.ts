@@ -1,6 +1,7 @@
 import { z } from "zod/v4";
 import type { ToolDef } from "../../types";
 import { apiFetch, describeApiError } from "./api";
+import type { NamedImageSource } from "@/lib/agent/image-ref";
 import { uploadNamedImages, type UploadedImageRef } from "./save-template";
 
 const inputSchema = z.object({
@@ -10,8 +11,8 @@ const inputSchema = z.object({
 });
 
 export interface SubmitSubmissionInput extends z.infer<typeof inputSchema> {
-	/** 由前端派发层注入：imageNames 对应的 data URL（已落盘的带 imageId，可复用不重复上传） */
-	images?: Array<{ name: string; dataUrl: string; imageId?: string }>;
+	/** 由前端派发层注入：imageNames 对应的图片（已落盘的带 imageId，可复用不重复上传） */
+	images?: NamedImageSource[];
 }
 
 export interface SubmitSubmissionOutput {

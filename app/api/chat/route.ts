@@ -18,19 +18,23 @@ import { buildProviderOptions } from "@/lib/llm/provider-options";
 import { LLM_CONFIG, VISION_LLM_CONFIG, getContextWindowInfo, getTaskMaxOutputTokens } from "@/lib/config";
 import { errorLogger } from "@/lib/logging";
 import { normalizeChatRouteError } from "@/lib/llm/error-normalize";
-import { maybeCompactMessages, normalizeCompactionCarry, pruneModelToolResults } from "@/lib/agent/context-compression";
+import { maybeCompactMessages, normalizeCompactionCarry, normalizeModelToolOutputs, pruneModelToolResults } from "@/lib/agent/context-compression";
 import {
-	IMAGE_INLINE_STEPS,
+	collectUserImageIds,
+	countInlinedImages,
 	demoteHistoryImages,
 	demoteImagesInModelMessages,
 	hydrateImageRefs,
+	imageInlineStepCount,
 } from "@/lib/agent/image-ref";
 import { readImageFile } from "@/lib/server/uploads";
 import { estimateTokens } from "@/lib/token-estimate";
-import { filterFormPhaseTools, FORM_PHASE_BUDGETS, FORM_TOTAL_STEP_BUDGET, isFormWorkflowExhausted, nextFormPhase, normalizeAgentPhase } from "@/lib/agent/form-workflow";
+import { decideWorkflowContinuation, filterFormPhaseTools, FORM_PHASE_BUDGETS, FORM_TOTAL_STEP_BUDGET, isFormWorkflowExhausted, nextFormPhase, normalizeAgentPhase } from "@/lib/agent/form-workflow";
 import "@/lib/env-check";
 
-export const maxDuration = 60;
+// 必须大于 AGENT_REQUEST_TIMEOUT_MS（默认 90s）+ 收尾开销，否则平台会在
+// 我们有机会下发超时事件之前就掐断连接。
+export const maxDuration = 150;
 
 const llm = buildLLM({
 	model: LLM_CONFIG.model,
@@ -104,8 +108,13 @@ function resolveRoleFromCookie(req: Request): UserRole | undefined {
 	}
 }
 
-function resolveModel(messages: AppUIMessage[]) {
-	const useVision = visionLlm && hasImageInMessages(messages);
+/**
+ * 视觉模型判定：只要「本轮请求里会有真图」就走视觉模型。
+ * 除了最新一轮 user 消息带图，还包括模板工作流续跑 —— 续跑请求的最后一条
+ * user 消息是「继续执行」这样的纯文本，但源图会被 hydrate 回 data URL。
+ */
+function resolveModel(hasVisionImage: boolean) {
+	const useVision = visionLlm && hasVisionImage;
 	const activeModelName = useVision ? VISION_LLM_CONFIG.model! : LLM_CONFIG.model;
 	const activeBaseURL = useVision
 		? (VISION_LLM_CONFIG.baseURL ?? LLM_CONFIG.baseURL)
@@ -173,7 +182,24 @@ function getRetryDelay(attempt: number, e: unknown): number {
 }
 
 const MAX_STEPS_PER_REQUEST = 6;
-const MAX_REQUEST_DURATION_MS = 45_000;
+
+/**
+ * 单次 /api/chat 请求的硬上限。超出即中断上游、把控制权交回客户端自动续跑。
+ * 视觉模型 + 大工具面（空白单据 → 模板）首包经常超过 45s，原来的 45s 会把
+ * 整轮任务直接判死（0 步、界面永久停在「思考中」）。
+ * 可用 AGENT_REQUEST_TIMEOUT_MS 覆盖（毫秒，最小 5000）。
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+const MIN_REQUEST_TIMEOUT_MS = 5_000;
+
+function resolveRequestTimeoutMs(): number {
+	const raw = Number(process.env.AGENT_REQUEST_TIMEOUT_MS);
+	return Number.isFinite(raw) && raw >= MIN_REQUEST_TIMEOUT_MS
+		? Math.floor(raw)
+		: DEFAULT_REQUEST_TIMEOUT_MS;
+}
+
+const MAX_REQUEST_DURATION_MS = resolveRequestTimeoutMs();
 
 function hasSuccessfulToolResult(messages: AppUIMessage[], toolName: string): boolean {
 	for (const message of messages) {
@@ -238,16 +264,26 @@ export async function POST(req: Request) {
 		return new Response("MCP initialization failed", { status: 500 });
 	}
 
-	const { model, provider, activeModelName, activeBaseURL } = resolveModel(messages);
+	const lastUserHasImage = hasImageInMessages(messages);
+	const persistedWorkflowActive = rawWorkflowActive === true;
+	const formTask = role === "admin" && (
+		(lastUserHasImage && /模板|单据|报销|表单/.test(getLastUserText(messages)))
+		|| persistedWorkflowActive
+	);
+	/**
+	 * 模板工作流的源图（管理员上传的空白单据）必须全程保持「可被视觉模型看到」：
+	 * 续跑请求（自动续跑 / 用户点「继续执行」）的最后一条 user 消息里没有图片，
+	 * 若按「只保留最新一轮图片」的规则降级，视觉模型只收到占位文本，就会回复
+	 * 「图片数据已被省略，请重新上传」——任务卡死在原地（2026-10-15 事故）。
+	 * 这些 id 会：① 跳过 demoteHistoryImages 降级；② 参与视觉模型判定。
+	 */
+	const workflowImageIds = formTask ? collectUserImageIds(messages) : [];
+	const keepImageIds = workflowImageIds.length > 0 ? new Set(workflowImageIds) : undefined;
+	const { model, provider, activeModelName, activeBaseURL } = resolveModel(lastUserHasImage || !!keepImageIds);
 	const activeRequestId = typeof requestId === "string" ? requestId : randomUUID();
 	const activeRunId = typeof runId === "string" ? runId : activeRequestId;
 	const startedAt = Date.now();
 	const contextWindow = getContextWindowInfo(activeModelName);
-	const persistedWorkflowActive = rawWorkflowActive === true;
-	const formTask = role === "admin" && (
-		(hasImageInMessages(messages) && /模板|单据|报销|表单/.test(getLastUserText(messages)))
-		|| persistedWorkflowActive
-	);
 	let workflowPhase = formTask ? normalizeAgentPhase(rawAgentPhase) : "build";
 	let workflowPhaseStep = typeof rawPhaseStep === "number" && rawPhaseStep >= 0 ? Math.floor(rawPhaseStep) : 0;
 	let workflowTotalStep = typeof rawTotalStep === "number" && rawTotalStep >= 0 ? Math.floor(rawTotalStep) : 0;
@@ -296,7 +332,8 @@ export async function POST(req: Request) {
 	// 注入检测仍基于原始 messages（在压缩前完成）。
 	// 历史轮的图片降级为占位文本（只保留最新一轮的真图），
 	// 既省流量，也让压缩阈值估算贴近真正发给模型的内容。
-	const requestMessages = demoteHistoryImages(messages);
+	// 模板工作流的源图不参与降级（否则续跑请求会丢掉图片，见上面的 keepImageIds）
+	const requestMessages = demoteHistoryImages(messages, { keepImageIds });
 	const compaction = await maybeCompactMessages({
 		messages: requestMessages,
 		modelName: activeModelName,
@@ -314,13 +351,18 @@ export async function POST(req: Request) {
 		})
 		: baseSystemPrompt;
 
-	// 最新一轮的图片引用还原成 data URL 交给视觉模型；解析失败自动降级为占位文本
-	const modelInputMessages = IMAGE_INLINE_STEPS > 0
-		? compaction.messages
-		: demoteHistoryImages(compaction.messages);
-	const modelMessages = await convertToModelMessages(
-		hydrateImageRefs(modelInputMessages, resolveUploadedImageRef),
-	);
+	// 图片引用 → data URL（视觉模型要的是真图；解析失败自动降级为占位文本）
+	// 压缩已经作用在 demoteHistoryImages 之后的 messages 上，这里直接还原即可。
+	const hydratedMessages = hydrateImageRefs(compaction.messages, resolveUploadedImageRef);
+	// 可观测性：本轮实际发出的真图张数（0 = 模型根本没收到图片）
+	const visionImages = countInlinedImages(hydratedMessages);
+	// 收口：统一把 tool-result 的 output 归一化成合法 ToolResultOutput。
+	// 历史会话可能残留无 type 的裁剪对象（旧版本 pruneModelToolResults 的产物），
+	// OpenAI 兼容网关遇到这种 output 会丢掉整个 content 字段，
+	// 直接以 `messages[N]: missing field content` 拒绝整条请求（2026-10-15 事故）。
+	const modelMessages = normalizeModelToolOutputs(await convertToModelMessages(
+		hydratedMessages,
+	));
 
 	const encoder = new TextEncoder();
 	let toolDurationMs = 0;
@@ -339,12 +381,62 @@ export async function POST(req: Request) {
 		try { streamController.enqueue(encoder.encode(`data: ${chunk}\n\n`)); } catch { /* stream already closed */ }
 	};
 
+	// 用自建 controller 而不是 AbortSignal.timeout()，才能区分
+	// 「用户主动中断」与「服务端硬超时」：后者必须显式告诉客户端收尾并续跑。
+	let serverTimedOut = false;
+	const timeoutController = new AbortController();
+	const requestTimeoutTimer = setTimeout(() => {
+		serverTimedOut = true;
+		timeoutController.abort(new Error(`请求超时（${MAX_REQUEST_DURATION_MS / 1000}s）`));
+	}, MAX_REQUEST_DURATION_MS);
+	const clearRequestTimeout = () => clearTimeout(requestTimeoutTimer);
+	const abortSignal = AbortSignal.any([req.signal, timeoutController.signal]);
+
+	/**
+	 * 超时收尾：上游被 abort 时只会发 abort chunk、不会补发 reasoning-end，
+	 * 因此必须显式下发「本轮被超时中断 + 能否自动续跑」，否则前端永久停在「思考中」。
+	 */
+	const emitTimeoutOutcome = () => {
+		const totalDurationMs = Date.now() - startedAt;
+		const steps = usageTracker.getStepCount();
+		const phaseComplete = formTask && workflowPhaseStep >= FORM_PHASE_BUDGETS[workflowPhase];
+		const nextPhase = phaseComplete && workflowPhase !== "finalize" ? nextFormPhase(workflowPhase) : workflowPhase;
+		const nextPhaseStep = nextPhase === workflowPhase ? workflowPhaseStep : 0;
+		const { autoContinue, workflowActive } = decideWorkflowContinuation({
+			formTask, templateSaved, workflowPaused, workflowHasToolCalls,
+			requestBudgetReached: true, workflowTotalStep, serverTimedOut: true,
+		});
+		pushData("data-reply-metrics", {
+			runId: activeRunId, requestId: activeRequestId,
+			totalDurationMs,
+			modelDurationMs: Math.max(0, totalDurationMs - toolDurationMs),
+			toolDurationMs, steps, retries,
+			compacted: compaction.compacted, model: activeModelName, provider,
+			contextWindow: contextWindow.value, contextWindowSource: contextWindow.source,
+			visionImages,
+			timedOut: true,
+		});
+		pushData("data-agent-progress", {
+			runId: activeRunId, requestId: activeRequestId, phase: nextPhase,
+			step: formTask ? workflowTotalStep : steps, phaseStep: nextPhaseStep,
+			totalStep: workflowTotalStep, elapsedMs: totalDurationMs,
+			workflowActive, autoContinue,
+		});
+		pushData("data-agent-timeout", {
+			runId: activeRunId, requestId: activeRequestId, phase: nextPhase,
+			elapsedMs: totalDurationMs, timeoutMs: MAX_REQUEST_DURATION_MS,
+			steps, toolCalls: workflowHasToolCalls, canContinue: autoContinue,
+		});
+		usageTracker.updateRequestTiming({ totalDurationMs, retries });
+	};
+
 	// 构造带重试的外层 ReadableStream（SSE 格式，与 AI SDK UI message stream 协议兼容）
 	const outerStream = new ReadableStream<Uint8Array>({
 		start(controller) {
 			streamController = controller;
 			(async () => {
 				if (workflowExhausted) {
+					clearRequestTimeout();
 					const errorChunk = JSON.stringify({ type: "error", errorText: `模板生成任务已达到 ${FORM_TOTAL_STEP_BUDGET} 个自动步骤上限，请检查当前工作簿后重新发起任务。` });
 					controller.enqueue(encoder.encode(`data: ${errorChunk}\n\n`));
 					controller.close();
@@ -372,7 +464,7 @@ export async function POST(req: Request) {
 					try {
 						const result = streamText({
 							model,
-							abortSignal: AbortSignal.any([req.signal, AbortSignal.timeout(MAX_REQUEST_DURATION_MS)]),
+							abortSignal,
 							system: injectionWarning ? `${systemPrompt}\n\n${injectionWarning}` : systemPrompt,
 							messages: modelMessages,
 							tools: boundedTools,
@@ -385,11 +477,12 @@ export async function POST(req: Request) {
 									activeTools: workflowActiveTools(moduleTracker.resolveActiveTools({
 									allTools, baseTools, gatewayTools, mcpTools: mcpToolNames,
 								})),
-								// 图片只在前 IMAGE_INLINE_STEPS 个 step 随请求发送，此后换成占位引用，
-								// 避免在长工具循环里每一步都重复搬运数百 KB
+								// 图片只在前 N 个 step 随请求发送，此后换成占位引用，避免在长工具循环里
+									// 每一步都重复搬运数百 KB；模板工作流的 N 更大
+									// （FORM_IMAGE_INLINE_STEPS），因为「看一眼 → 核对画布 → 出结果」跨多个 step
 								messages: injectCacheControl(
 									pruneModelToolResults(
-										stepNumber >= IMAGE_INLINE_STEPS
+										stepNumber >= imageInlineStepCount(formTask)
 											? demoteImagesInModelMessages(stepMsgs)
 											: stepMsgs,
 										4,
@@ -459,12 +552,28 @@ export async function POST(req: Request) {
 							// value 是 UIMessageChunk 对象，需序列化为 SSE data line
 							controller.enqueue(encoder.encode(`data: ${JSON.stringify(value)}\n\n`));
 						}
+						clearRequestTimeout();
+
+						// 客户端在流中途 abort：不再补发 metrics / 超时事件
+						if (req.signal.aborted) {
+							try { controller.close(); } catch { /* already closed */ }
+							return;
+						}
+
+						// 服务端硬超时：统一走超时收尾（metrics + 续跑标记 + 超时事件）
+						if (serverTimedOut) {
+							emitTimeoutOutcome();
+							try { controller.close(); } catch { /* already closed */ }
+							return;
+						}
+
 						const metrics = {
 							runId: activeRunId, requestId: activeRequestId,
 							totalDurationMs: Date.now() - startedAt,
 							modelDurationMs: Math.max(0, Date.now() - startedAt - toolDurationMs), toolDurationMs, steps: usageTracker.getStepCount(), retries,
 							compacted: compaction.compacted, model: activeModelName, provider,
 							contextWindow: contextWindow.value, contextWindowSource: contextWindow.source,
+						visionImages,
 						};
 						usageTracker.updateRequestTiming({ totalDurationMs: metrics.totalDurationMs, retries });
 						const phaseComplete = formTask && workflowPhaseStep >= FORM_PHASE_BUDGETS[workflowPhase];
@@ -474,8 +583,10 @@ export async function POST(req: Request) {
 							workflowPhaseStep >= FORM_PHASE_BUDGETS[workflowPhase]
 							|| usageTracker.getStepCount() >= requestStepLimit
 						);
-						const autoContinue = Boolean(formTask && !templateSaved && !workflowPaused && workflowHasToolCalls && requestBudgetReached && workflowTotalStep < FORM_TOTAL_STEP_BUDGET);
-						const workflowActive = Boolean(formTask && !templateSaved && workflowTotalStep < FORM_TOTAL_STEP_BUDGET && (autoContinue || workflowPaused || workflowHasToolCalls));
+						const { autoContinue, workflowActive } = decideWorkflowContinuation({
+							formTask, templateSaved, workflowPaused, workflowHasToolCalls,
+							requestBudgetReached, workflowTotalStep, serverTimedOut,
+						});
 						pushData("data-reply-metrics", metrics);
 						pushData("data-agent-progress", {
 							runId: activeRunId, requestId: activeRequestId, phase: nextPhase,
@@ -483,13 +594,22 @@ export async function POST(req: Request) {
 							totalStep: workflowTotalStep, elapsedMs: metrics.totalDurationMs,
 							workflowActive, autoContinue,
 						});
-						controller.close();
+						try { controller.close(); } catch { /* already closed */ }
 						return;
 
 					} catch (e) {
+						clearRequestTimeout();
+
 						// 客户端已 abort，静默退出
 						if (req.signal.aborted) {
-							controller.close();
+							try { controller.close(); } catch { /* already closed */ }
+							return;
+						}
+
+						// 服务端超时抛出的异常：按超时收尾，而不是当可重试错误反复重发
+						if (serverTimedOut) {
+							emitTimeoutOutcome();
+							try { controller.close(); } catch { /* already closed */ }
 							return;
 						}
 
@@ -534,8 +654,9 @@ export async function POST(req: Request) {
 								resolve();
 							}, { once: true });
 						});
-						if (req.signal.aborted) {
-							controller.close();
+						if (req.signal.aborted || serverTimedOut) {
+							clearRequestTimeout();
+							try { controller.close(); } catch { /* already closed */ }
 							return;
 						}
 					}

@@ -1,16 +1,24 @@
 // ============================================================================
 // 图片引用降级：历史轮图片 → 占位文本、uploadId → data URL 还原、
 // 同轮非首个 step 的图片降级。核心诉求：图片数据不再每轮/每步重复随请求发送。
+// 以及模板工作流源图的「不降级」例外（2026-10-15 事故：续跑请求丢掉源图后
+// 模型会要求用户重新上传）。
 // ============================================================================
 import { describe, expect, it, vi } from "vitest";
 import {
+	FORM_IMAGE_INLINE_STEPS,
 	IMAGE_INLINE_STEPS,
-		demoteAllUserImages,
+	collectImageIdsByName,
+	collectUserImageIds,
+	countInlinedImages,
+	demoteAllUserImages,
 	demoteHistoryImages,
 	demoteImagesInModelMessages,
 	hydrateImageRefs,
+	imageInlineStepCount,
 	isImageUIPart,
 	parseUploadId,
+	pickNamedImages,
 	uploadUrlFor,
 } from "@/lib/agent/image-ref";
 import type { AppUIMessage } from "@/lib/agent/ui-message";
@@ -150,7 +158,7 @@ describe("demoteImagesInModelMessages", () => {
 	it("仅前若干个 step 内联图片（策略常量）", () => {
 		expect(IMAGE_INLINE_STEPS).toBe(1);
 	});
-});
+});
 describe("demoteAllUserImages", () => {
 	it("首轮完成后的所有 user 图片都只保留 uploadId 占位引用", () => {
 		const messages = [
@@ -165,3 +173,109 @@ describe("demoteAllUserImages", () => {
 	});
 });
 
+
+describe("表单工作流源图不降级（keepImageIds）", () => {
+	it("命中的历史图片保持引用，未命中的照常降级", () => {
+		const keepRef = uploadUrlFor("src_img");
+		const otherRef = uploadUrlFor("other_img");
+		const messages = [
+			userMsg("u1", [textPart("空白单据"), filePart("blank.jpg", keepRef)]),
+			assistantMsg("a1"),
+			userMsg("u2", [textPart("另一张"), filePart("other.jpg", otherRef)]),
+			assistantMsg("a2"),
+			userMsg("u3", [textPart("继续执行")]),
+		];
+		const out = demoteHistoryImages(messages, { keepImageIds: new Set(["src_img"]) });
+
+		// 命中的源图仍是 file part（服务端会 hydrate 成真图）
+		expect(out[0].parts[1]).toEqual(filePart("blank.jpg", keepRef));
+		// 未命中的历史图片降级为占位文本
+		const demoted = out[2].parts[1] as { type: string; text: string };
+		expect(demoted.type).toBe("text");
+		expect(demoted.text).toContain("other_img");
+	});
+
+	it("未传 keepImageIds 时行为不变（全部历史图片降级）", () => {
+		const messages = [
+			userMsg("u1", [filePart("blank.jpg", uploadUrlFor("src_img"))]),
+			assistantMsg("a1"),
+			userMsg("u2", [textPart("继续执行")]),
+		];
+		const out = demoteHistoryImages(messages);
+		expect((out[0].parts[0] as { type: string }).type).toBe("text");
+	});
+
+	it("keepImageIds 与最新一轮重合时不重复处理（返回原数组引用）", () => {
+		const ref = uploadUrlFor("src_img");
+		const messages = [userMsg("u1", [filePart("blank.jpg", ref)])];
+		expect(demoteHistoryImages(messages, { keepImageIds: new Set(["src_img"]) })).toBe(messages);
+	});
+});
+
+describe("collectUserImageIds / collectImageIdsByName / countInlinedImages", () => {
+	it("collectUserImageIds 只收 user 图片引用，去重且保持顺序", () => {
+		const messages = [
+			userMsg("u1", [filePart("a.jpg", uploadUrlFor("img_a"))]),
+			assistantMsg("a1", [filePart("shot.png", uploadUrlFor("img_shot"))]),
+			userMsg("u2", [textPart("继续"), filePart("a.jpg", uploadUrlFor("img_a")), filePart("b.jpg", uploadUrlFor("img_b"))]),
+		];
+		expect(collectUserImageIds(messages)).toEqual(["img_a", "img_b"]);
+	});
+
+	it("collectUserImageIds 忽略内联 data URL 与文本", () => {
+		const messages = [userMsg("u1", [textPart("hi"), filePart("inline.jpg", DATA_URL)])];
+		expect(collectUserImageIds(messages)).toEqual([]);
+	});
+
+	it("collectImageIdsByName 还原 文件名 → uploadId（刷新后复用已上传图片）", () => {
+		const messages = [
+			userMsg("u1", [filePart(" blank.jpg ", uploadUrlFor("img_a"))]),
+			userMsg("u2", [filePart("inline.jpg", DATA_URL)]),
+		];
+		const map = collectImageIdsByName(messages);
+		expect(map.get("blank.jpg")).toBe("img_a");
+		expect(map.size).toBe(1);
+	});
+
+	it("countInlinedImages 只数仍带真图 data URL 的 user 图片", () => {
+		const messages = [
+			userMsg("u1", [filePart("ref.jpg", uploadUrlFor("img_a"))]),
+			userMsg("u2", [filePart("inline.jpg", DATA_URL)]),
+		];
+		expect(countInlinedImages(messages)).toBe(1);
+	});
+});
+
+describe("imageInlineStepCount", () => {
+	it("模板工作流保留更多 step 的真图，普通聊天保持 IMAGE_INLINE_STEPS", () => {
+		expect(imageInlineStepCount(true)).toBe(FORM_IMAGE_INLINE_STEPS);
+		expect(imageInlineStepCount(false)).toBe(IMAGE_INLINE_STEPS);
+		expect(FORM_IMAGE_INLINE_STEPS).toBeGreaterThan(IMAGE_INLINE_STEPS);
+	});
+});
+
+describe("pickNamedImages", () => {
+	it("优先用暂存区的 data URL，并带上已落盘的 imageId", () => {
+		const out = pickNamedImages(
+			["a.jpg"],
+			new Map([["a.jpg", DATA_URL]]),
+			new Map([["a.jpg", "img_a"]]),
+			new Map(),
+		);
+		expect(out).toEqual([{ name: "a.jpg", dataUrl: DATA_URL, imageId: "img_a" }]);
+	});
+
+	it("暂存区为空时用历史消息里的 imageId 兜底（不再要求用户重新上传）", () => {
+		const out = pickNamedImages(["blank.jpg"], new Map(), new Map(), new Map([["blank.jpg", "img_hist"]]));
+		expect(out).toEqual([{ name: "blank.jpg", dataUrl: undefined, imageId: "img_hist" }]);
+	});
+
+	it("容忍首尾空格与大小写差异", () => {
+		const out = pickNamedImages([" Blank.JPG "], new Map(), new Map(), new Map([["blank.jpg", "img_hist"]]));
+		expect(out.map((i) => i.imageId)).toEqual(["img_hist"]);
+	});
+
+	it("三个来源都没有时跳过（保持原行为：不注入）", () => {
+		expect(pickNamedImages(["missing.jpg"], new Map(), new Map(), new Map())).toEqual([]);
+	});
+});

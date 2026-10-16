@@ -11,6 +11,7 @@ import { resolveAddress, parseRangeAddress } from "@/lib/spreadjs/utils";
 import { loadBridge } from "@/lib/tools/types";
 import type { ConfirmRequest } from "@/lib/hooks/useDestructiveGuard";
 import { setFormContext } from "@/lib/agent/form-context";
+import { pickNamedImages } from "@/lib/agent/image-ref";
 import type { LoadTemplateOutput } from "@/lib/tools/defs/form/load-template";
 import type { TemplateField } from "@/lib/server/types";
 
@@ -74,21 +75,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, toolName: string): Prom
  * 按文件名从暂存区取出图片（缺失的静默跳过，由工具/服务端报错兜底）。
  * 附件阶段已落盘的图片会带上 imageId，工具侧可直接复用，避免二次上传数百 KB。
  */
-function pickImages(
-	store: Map<string, string> | null | undefined,
-	names: string[],
-	imageIds?: Map<string, string> | null,
-): Array<{ name: string; dataUrl: string; imageId?: string }> {
-	const out: Array<{ name: string; dataUrl: string; imageId?: string }> = [];
-	for (const name of names) {
-		const dataUrl = store?.get(name);
-		if (!dataUrl) continue;
-		const imageId = imageIds?.get(name);
-		out.push(imageId ? { name, dataUrl, imageId } : { name, dataUrl });
-	}
-	return out;
-}
-
 /** addToolOutput 函数签名（AI SDK 6 discriminated union） */
 type AddToolOutputFn = UseChatHelpers<AppUIMessage>["addToolOutput"];
 type ScreenshotToolData = {
@@ -363,6 +349,8 @@ export function useToolDispatch(
 	onAfterExecuteCode?: () => void,
 	/** 附件阶段已落盘的图片：name → imageId（可选，用于复用避免重复上传） */
 	imageIdsRef?: React.RefObject<Map<string, string>>,
+	/** 历史消息里出现过的图片：name → imageId（页面刷新后暂存区为空时兜底） */
+	historyImageIdsRef?: React.RefObject<Map<string, string>>,
 ) {
 	const addToolOutputRef = useRef<AddToolOutputFn | null>(null);
 	const workbookRef = useRef(workbook);
@@ -450,12 +438,24 @@ export function useToolDispatch(
 				}
 			}
 
-			// save_template / submit_submission: 按文件名把图片附件转成 { name, dataUrl } 注入
+			// save_template / submit_submission: 按文件名把图片转成 { name, dataUrl?, imageId? } 注入。
+			// 暂存区为空（页面刷新等）时用历史消息里已上传的 imageId 兜底，
+			// 避免「明明上传过却要求用户重新上传」或静默丢掉模板原图。
 			if (name === "save_template" && !input.sourceImages && Array.isArray(input.sourceImageNames)) {
-				input.sourceImages = pickImages(pendingFilesRef.current, input.sourceImageNames as string[], imageIdsRef?.current);
+				input.sourceImages = pickNamedImages(
+					input.sourceImageNames as string[],
+					pendingFilesRef.current,
+					imageIdsRef?.current,
+					historyImageIdsRef?.current,
+				);
 			}
 			if (name === "submit_submission" && !input.images && Array.isArray(input.imageNames)) {
-				input.images = pickImages(pendingFilesRef.current, input.imageNames as string[], imageIdsRef?.current);
+				input.images = pickNamedImages(
+					input.imageNames as string[],
+					pendingFilesRef.current,
+					imageIdsRef?.current,
+					historyImageIdsRef?.current,
+				);
 			}
 
 			// 只读工具缓存命中 → 直接返回

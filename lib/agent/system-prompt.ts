@@ -290,7 +290,12 @@ const formWorkflowSection: SectionBuilder = (ctx) => {
 		verify: "读取关键区域核对字段地址、合并区域和布局。发现问题时回到写入工具修正；不要调用 save_template。",
 		finalize: "确认模板结构无误后调用一次 save_template 保存模板和字段地图。保存成功后停止，不要重复覆盖保存。",
 	};
-	return `## 当前模板生成阶段：${ctx.workflowPhase}\n\n${instructions[ctx.workflowPhase]}`;
+	const shared = [
+		"本次任务的源图（管理员上传的空白单据）已经在对话历史里，你可以直接查看；",
+		"即使某条历史消息中的图片被省略成 [图片: 文件名] 占位文本，也只代表「不重复传输」，",
+		"不代表图片丢失——沿用你此前已经识别到的版式与字段结论继续执行，不要要求用户重新上传。",
+	].join("");
+	return `## 当前模板生成阶段：${ctx.workflowPhase}\n\n${instructions[ctx.workflowPhase]}\n\n${shared}`;
 };
 
 // ----------------------------------------------------------------------------

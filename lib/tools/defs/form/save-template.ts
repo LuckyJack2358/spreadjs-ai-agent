@@ -1,5 +1,6 @@
 import { z } from "zod/v4";
 import type { ToolDef } from "../../types";
+import type { NamedImageSource } from "@/lib/agent/image-ref";
 import { apiFetch, describeApiError } from "./api";
 
 export const templateFieldSchema = z.object({
@@ -49,19 +50,21 @@ export function summarizeTemplate(t: {
 /** 处理 sourceImageNames → /api/uploads，返回 imageRefs */
 export async function uploadNamedImages(
 	names: string[] | undefined,
-	injected: Array<{ name: string; dataUrl: string; imageId?: string }> | undefined,
+	injected: Array<{ name: string; dataUrl?: string; imageId?: string }> | undefined,
 ): Promise<UploadedImageRef[]> {
 	if (!names?.length) return [];
-	const byName = new Map((injected ?? []).map((i) => [i.name, i]));
+	const byName = new Map((injected ?? []).map((i) => [i.name.trim(), i]));
 	const refs: UploadedImageRef[] = [];
 
-	// 附件阶段已落盘（占绝大多数）：直接复用 imageId，不再重复上传数百 KB
+	// 附件阶段已落盘（占绝大多数）：直接复用 imageId，不再重复上传数百 KB；
+	// 只剩 imageId（页面刷新后靠历史消息兜底）时同样直接复用。
 	const pending: Array<{ name: string; dataUrl: string }> = [];
-	for (const name of names) {
+	for (const rawName of names) {
+		const name = rawName.trim();
 		const hit = byName.get(name);
 		if (!hit) continue;
 		if (hit.imageId) refs.push({ id: hit.imageId, name });
-		else pending.push({ name, dataUrl: hit.dataUrl });
+		else if (hit.dataUrl) pending.push({ name, dataUrl: hit.dataUrl });
 	}
 
 	for (const { name, dataUrl } of pending) {
@@ -88,7 +91,7 @@ const inputSchema = z.object({
 });
 
 export type SaveTemplateInput = z.infer<typeof inputSchema> & {
-	sourceImages?: Array<{ name: string; dataUrl: string; imageId?: string }>;
+	sourceImages?: NamedImageSource[];
 };
 
 export interface SaveTemplateOutput {

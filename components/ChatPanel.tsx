@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef, memo } from "react";
 import Image from "next/image";
@@ -21,13 +21,17 @@ import {
 	isAppToolPart,
 	isContextCompactedPart,
 	isAgentProgressPart,
+	isAgentTimeoutPart,
 	isReplyMetricsPart,
 	isRetryStatusPart,
 	isTaskToolPart,
+	hasStreamingParts,
+	markStreamingPartsDone,
 	type AppUIMessage,
 	type AppUIMessagePart,
 	type ContextCompactedData,
 	type AgentProgressData,
+	type AgentTimeoutData,
 	type ReplyMetrics,
 } from "@/lib/agent/ui-message";
 import { useAttachments } from "@/lib/hooks/useAttachments";
@@ -45,6 +49,8 @@ import type { CompactionCarry } from "@/lib/agent/context-compression";
 import { SettingsPanel } from "@/components/settings-panel";
 import { useSettings } from "@/lib/hooks/useSettings";
 import { notifyFormDataChanged } from "@/lib/agent/form-context";
+import { shouldSuppressTimeoutContinue } from "@/lib/agent/form-workflow";
+import { collectImageIdsByName } from "@/lib/agent/image-ref";
 import { subscribeSheetToChat, buildSheetChatPrompt } from "@/lib/agent/sheet-chat-bridge";
 import { useTheme } from "@/lib/hooks/useTheme";
 import { ServiceUnavailableBanner } from "@/components/ai-elements/service-unavailable-banner";
@@ -374,6 +380,13 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const [agentProgress, setAgentProgress] = useState<AgentProgressData | null>(null);
 	const [replyMetrics, setReplyMetrics] = useState<ReplyMetrics | null>(null);
 	const replyMetricsRef = useRef<ReplyMetrics | null>(null);
+	/** 最近一次服务端硬超时（data-agent-timeout），用于「请求超时」提示与续跑判定 */
+	const [agentTimeout, setAgentTimeout] = useState<AgentTimeoutData | null>(null);
+	const agentTimeoutRef = useRef<AgentTimeoutData | null>(null);
+	/** 连续「零进展超时」计数：超过阈值后停止自动续跑，避免反复空烧 token */
+	const zeroProgressTimeoutCountRef = useRef(0);
+	/** 历史消息里出现过的图片（name → uploadId）：暂存区被清空/刷新后仍能复用已上传的图 */
+	const historyImageIdsRef = useRef<Map<string, string>>(new Map());
 	const [compacting, setCompacting] = useState(false);
 	const [compactionError, setCompactionError] = useState<string | null>(null);
 	const requestMetaRef = useRef<{
@@ -444,7 +457,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const { consume: consumeDirty } = useDirtyTracker(workbook);
 	const { buildBody } = useChatContext(workbook, consumeDirty, role, session.compaction ?? null, requestMetaRef);
 	const { confirmDialog, requestConfirm, onConfirmChoice } = useDestructiveGuard(settings.allowAllDestructive);
-	const { onToolCall, addToolOutputRef } = useToolDispatch(workbook, pendingFilesRef, requestConfirm, refreshSheetInfo, imageIdsRef);
+	const { onToolCall, addToolOutputRef } = useToolDispatch(workbook, pendingFilesRef, requestConfirm, refreshSheetInfo, imageIdsRef, historyImageIdsRef);
 
 	// 稳定引用：避免内联创建导致 useChat 每次重建触发 messages 无限 rerender
 	const transport = useMemo(
@@ -545,6 +558,19 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 				});
 			}
 		}
+		if (isAgentTimeoutPart(part)) {
+			agentTimeoutRef.current = part.data;
+			setAgentTimeout(part.data);
+			// 一步都没跑完就超时（通常是视觉模型首包太慢）：累计零进展次数，
+			// 超过阈值后客户端不再自动续跑，避免无限重发同一轮请求。
+			if (part.data.steps === 0 && !part.data.toolCalls) {
+				zeroProgressTimeoutCountRef.current++;
+			} else {
+				zeroProgressTimeoutCountRef.current = 0;
+			}
+			// 服务端判定不需要续跑（已保存模板 / 非模板任务 / 预算耗尽）→ 结束工作流
+			if (!part.data.canContinue) workflowActiveRef.current = false;
+		}
 		if (isReplyMetricsPart(part)) {
 			replyMetricsRef.current = part.data;
 			setReplyMetrics(part.data);
@@ -559,6 +585,36 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		onToolCall,
 		onData: handleChatData,
 	});
+
+	// 历史消息里的图片引用（name → uploadId）：只写 ref，不触发渲染。
+	// 页面刷新或换了会话后暂存区是空的，工具派发层靠它复用已经落盘的单据图，
+	// 不必让用户把同一张图再传一次。
+	useEffect(() => {
+		historyImageIdsRef.current = collectImageIdsByName(messages);
+	}, [messages]);
+
+	// 上游 abort（服务端硬超时 / 用户中断）只会发 abort chunk、不会补发 reasoning-end，
+	// 悬空的 streaming part 会让标题栏永久停在「正在思考」、输入框也无法回到就绪。
+	// 流一旦结束就统一收尾，保证界面能回到可交互状态。
+	useEffect(() => {
+		if (status === "streaming" || status === "submitted") return;
+		// 先做只读判断，只有确实存在悬空 streaming part 时才写回：
+		// useChat 的 setMessages 每次都会复制一份数组（引用必变），
+		// 无条件调用会让本 effect 因 messages 依赖无限重跑 → Maximum update depth exceeded。
+		const needsFinalize = messages.some((m) => m.role === "assistant" && hasStreamingParts(m.parts));
+		if (!needsFinalize) return;
+		setMessages((prev) => {
+			let changed = false;
+			const next = prev.map((message) => {
+				if (message.role !== "assistant") return message;
+				const { parts, changed: partChanged } = markStreamingPartsDone(message.parts);
+				if (!partChanged) return message;
+				changed = true;
+				return { ...message, parts };
+			});
+			return changed ? next : prev;
+		});
+	}, [status, messages, setMessages]);
 
 	// 跨消息预计算：每个 planId 最后一次出现的位置，以及全局最后一个任务工具位置
 	// key 格式 `${messageId}:${partIdx}`
@@ -672,6 +728,9 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		setReplyMetrics(null);
 		replyMetricsRef.current = null;
 		setAgentProgress(null);
+		setAgentTimeout(null);
+		agentTimeoutRef.current = null;
+		zeroProgressTimeoutCountRef.current = 0;
 		setCurrentRequestId(null);
 		currentRequestIdRef.current = null;
 		const workflow = sessionWorkflowStateRef.current;
@@ -851,6 +910,16 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 			text: "发生错误",
 			icon: <AlertCircleIcon className="size-3 text-destructive" />,
 		};
+		// 服务端硬超时：必须给出明确状态，而不是让界面停在「正在思考」
+		if (status === "ready" && agentTimeout) return agentTimeout.canContinue && !shouldSuppressTimeoutContinue(zeroProgressTimeoutCountRef.current)
+			? {
+				text: "请求超时，正在继续",
+				icon: <LoaderIcon className="size-3 animate-spin text-amber-500" />,
+			}
+			: {
+				text: "请求超时",
+				icon: <AlertCircleIcon className="size-3 text-amber-500" />,
+			};
 		// 最后一条助手消息被中断 → 直接就绪，跳过残留的流式状态检查
 		if (lastMsgInterrupted) return {
 			text: "就绪",
@@ -875,7 +944,7 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 			text: "就绪",
 			icon: <CircleCheckIcon className="size-3 text-emerald-500" />,
 		};
-	}, [isReady, status, messages, stepLimitPaused, lastMsgInterrupted]);
+	}, [isReady, status, messages, stepLimitPaused, lastMsgInterrupted, agentTimeout]);
 
 	const sendMessageRef = useRef(sendMessage);
 	sendMessageRef.current = sendMessage;
@@ -998,6 +1067,15 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		if (!pending || lastAutoContinuedRunIdRef.current === pending.runId || replyContinuationPendingRef.current) return;
 		if (wasStoppedRef.current || stepLimitPaused || !workflowActiveRef.current) return;
 
+		// 本轮是超时续跑、且已经连续多次零进展：停止自动续跑，交给用户决定是否继续
+		const timedOutRun = agentTimeoutRef.current?.runId === pending.runId;
+		if (timedOutRun && shouldSuppressTimeoutContinue(zeroProgressTimeoutCountRef.current)) {
+			console.warn("[autoContinue] 连续零进展超时过多，已停止自动续跑");
+			autoContinueRef.current = null;
+			workflowActiveRef.current = false;
+			return;
+		}
+
 		if (autoStepCountRef.current >= settings.maxAutoSteps) {
 			setStepLimitPaused(true);
 			return;
@@ -1007,6 +1085,8 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		lastAutoContinuedRunIdRef.current = pending.runId;
 		autoStepCountRef.current++;
 		replyContinuationPendingRef.current = true;
+		setAgentTimeout(null);
+		agentTimeoutRef.current = null;
 		void ensureConnected().then(() => {
 			if (wasStoppedRef.current || !workflowActiveRef.current) {
 				replyContinuationPendingRef.current = false;
@@ -1022,6 +1102,9 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 	const handleContinue = useCallback(() => {
 		autoStepCountRef.current = 0;
 		setStepLimitPaused(false);
+		zeroProgressTimeoutCountRef.current = 0;
+		setAgentTimeout(null);
+		agentTimeoutRef.current = null;
 		stableSendMessageWithSnapshot({ text: "继续执行" });
 	// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, []);
@@ -1046,6 +1129,9 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 		wasStoppedRef.current = false;
 		autoStepCountRef.current = 0;
 		setStepLimitPaused(false);
+		setAgentTimeout(null);
+		agentTimeoutRef.current = null;
+		zeroProgressTimeoutCountRef.current = 0;
 		if (!(await compactBeforeSend())) return;
 		// 确保 MCP 连接存活（节流 60s），等待完成再发送消息
 		await ensureConnected();
@@ -1518,6 +1604,39 @@ export default function ChatPanel({ chatPanelWidth, onChatPanelWidthChange }: Ch
 					</button>
 				</div>
 			)}
+
+			{/* 服务端请求超时提示：自动续跑中 / 已停止续跑（可手动继续） */}
+			{agentTimeout && !isGenerating && status !== "error" && (() => {
+				const elapsed = Math.round(agentTimeout.elapsedMs / 1000);
+				const suppressed = shouldSuppressTimeoutContinue(zeroProgressTimeoutCountRef.current);
+				const continuing = agentTimeout.canContinue && !suppressed;
+				const detail = "本轮请求超过 " + elapsed + "s 未返回（已完成 " + agentTimeout.steps + " 步）";
+				return (
+					<div className="flex items-center gap-2 border-t border-amber-200/70 bg-amber-50/80 px-4 py-2 dark:border-amber-900/40 dark:bg-amber-950/20">
+						<AlertCircleIcon className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+						<span className="min-w-0 flex-1 truncate text-xs text-amber-700 dark:text-amber-400">
+							{continuing ? detail + "，正在自动继续…" : detail + "，已停止自动续跑"}
+						</span>
+						{!continuing && (
+							<button
+								type="button"
+								onClick={handleContinue}
+								className="shrink-0 rounded-md bg-primary px-2.5 py-1 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+							>
+								继续执行
+							</button>
+						)}
+						<button
+							type="button"
+							onClick={() => { setAgentTimeout(null); agentTimeoutRef.current = null; }}
+							className="shrink-0 inline-flex items-center justify-center rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+							aria-label="关闭超时提示"
+						>
+							<XIcon className="size-3.5" />
+						</button>
+					</div>
+				);
+			})()}
 
 			{/* 上下文已自动压缩提示（服务端把早期历史压成摘要后不再需要新建会话） */}
 			{contextCompacted && !isGenerating && contextUsage.percent >= CONTEXT_WARN_THRESHOLD && (

@@ -19,7 +19,7 @@
  *    绝不让压缩本身阻断对话。
  */
 
-import { generateText, type LanguageModel, type ModelMessage } from "ai";
+import { generateText, type LanguageModel, type ModelMessage, type ToolResultPart } from "ai";
 import {
 	getAppToolName,
 	isAppToolPart,
@@ -123,14 +123,79 @@ const IMPORTANT_TOOL_NAMES: ReadonlySet<string> = new Set([
 	"complete_task",
 ]);
 
-function truncateToolOutput(output: unknown): { truncated: true; note: string; originalChars: number; preview: string } {
-	const raw = safeStringify(output);
+/**
+ * 合法的 ToolResultOutput 判别值。
+ *
+ * 上游 OpenAI 兼容网关（以及 `@ai-sdk/openai` 的 convertToOpenAIChatMessages）
+ * 按 `output.type` 分支取值：类型不在白名单内时 content 变量不会被赋值，
+ * 序列化时整个 `content` 字段被丢弃 → 网关报
+ * `Failed to deserialize the JSON body ... messages[N]: missing field content`
+ * （2026-10-15 事故：pruneModelToolResults 把 output 换成了无 type 的对象）。
+ */
+const VALID_TOOL_RESULT_OUTPUT_TYPES: ReadonlySet<string> = new Set([
+	"text",
+	"json",
+	"content",
+	"error-text",
+	"error-json",
+	"execution-denied",
+]);
+
+/**
+ * 兜底归一化：保证 tool-result 的 output 一定是合法的 ToolResultOutput。
+ *
+ * 非法形状（缺 type / 未知 type）统一包成 `{ type: "json", value }`，
+ * 既不会丢内容，也不会让上游因为缺 `content` 直接拒绝整条请求。
+ */
+export function normalizeToolResultOutput(output: unknown): ToolResultPart["output"] {
+	if (output != null && typeof output === "object" && !Array.isArray(output)) {
+		const type = (output as { type?: unknown }).type;
+		if (typeof type === "string" && VALID_TOOL_RESULT_OUTPUT_TYPES.has(type)) {
+			return output as ToolResultPart["output"];
+		}
+	}
+	// 值类型与 ToolResultOutput 的 JSONValue 不完全等价，这里收口一次
+	return { type: "json", value: (output ?? null) as never };
+}
+
+/** 把大体积工具结果换成「带预览的占位结果」（必须是合法 ToolResultOutput） */
+function truncateToolOutput(output: unknown): ToolResultPart["output"] {
+	const normalized = normalizeToolResultOutput(output);
+	const raw = safeStringify(normalized);
 	return {
-		truncated: true,
-		note: "历史工具结果已压缩，仅保留开头预览",
-		originalChars: raw.length,
-		preview: raw.slice(0, OVERSIZED_TOOL_PREVIEW_CHARS),
+		type: "json",
+		value: {
+			truncated: true,
+			note: "历史工具结果已压缩，仅保留开头预览",
+			originalChars: raw.length,
+			preview: raw.slice(0, OVERSIZED_TOOL_PREVIEW_CHARS),
+		},
 	};
+}
+
+/**
+ * 兜底：把每条 tool 消息里 tool-result 的 output 归一化到合法形状。
+ * 与裁剪无关，只修形状——用于「任何来源的 ModelMessage 都可能带非法 output」的收口。
+ */
+export function normalizeModelToolOutputs(messages: ModelMessage[]): ModelMessage[] {
+	let changed = false;
+
+	const next = messages.map((message) => {
+		if (message.role !== "tool") return message;
+		let messageChanged = false;
+		const content = message.content.map((part) => {
+			if (part.type !== "tool-result") return part;
+			const normalized = normalizeToolResultOutput(part.output);
+			if (normalized === part.output) return part;
+			messageChanged = true;
+			return { ...part, output: normalized };
+		});
+		if (!messageChanged) return message;
+		changed = true;
+		return { ...message, content } as ModelMessage;
+	});
+
+	return changed ? next : messages;
 }
 
 /**
@@ -138,6 +203,7 @@ function truncateToolOutput(output: unknown): { truncated: true; note: string; o
  *
  * ModelMessage 的 assistant tool-call 与 tool tool-result 仍然保留原有
  * toolCallId，只替换 result.output，因此不会破坏 AI SDK 的调用配对。
+ * 替换值必须是合法 ToolResultOutput（见 normalizeToolResultOutput 的注释）。
  */
 export function pruneModelToolResults(messages: ModelMessage[], intactTail = COMPACT_KEEP_INTACT_MESSAGES): ModelMessage[] {
 	const intactFrom = Math.max(0, messages.length - intactTail);
@@ -148,12 +214,24 @@ export function pruneModelToolResults(messages: ModelMessage[], intactTail = COM
 		let messageChanged = false;
 		const content = message.content.map((part) => {
 			if (part.type !== "tool-result") return part;
+			// 先修形状：非法 output（如历史数据里的无 type 对象）一律归一化，
+			// 否则会被上游当成「缺 content」直接拒绝整条请求。
+			const output = normalizeToolResultOutput(part.output);
+			const repaired = output === part.output ? part : { ...part, output };
 			const toolName = typeof part.toolName === "string" ? part.toolName : "";
-			if (IMPORTANT_TOOL_NAMES.has(toolName)) return part;
-			const raw = safeStringify(part.output);
-			if (raw.length <= OVERSIZED_TOOL_OUTPUT_CHARS) return part;
+			if (IMPORTANT_TOOL_NAMES.has(toolName)) {
+				if (output === part.output) return part;
+				messageChanged = true;
+				return repaired;
+			}
+			const raw = safeStringify(output);
+			if (raw.length <= OVERSIZED_TOOL_OUTPUT_CHARS) {
+				if (output === part.output) return part;
+				messageChanged = true;
+				return repaired;
+			}
 			messageChanged = true;
-			return { ...part, output: truncateToolOutput(part.output) };
+			return { ...part, output: truncateToolOutput(output) };
 		});
 		if (!messageChanged) return message;
 		changed = true;
